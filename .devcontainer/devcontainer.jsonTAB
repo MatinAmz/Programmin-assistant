@@ -1,0 +1,24 @@
+{
+  "name": "Flask Development Environment",
+  "image": "mcr.microsoft.com/devcontainers/python:3.9",
+  "features": {
+    "python": "latest",
+    "docker-in-docker": "latest"
+  },
+  "postCreateCommand": "pip install flask",
+  "settings": {
+    "python.pythonPath": "/usr/local/bin/python"
+  },
+  "extensions": [
+    "ms-python.python",
+    "ms-python.vscode-pylance"
+  ],
+  "forwardPorts": [
+    5000
+  ],
+  "remoteUser": "vscode"
+}
+
+
+
+

@@ -52,58 +52,58 @@
 
 ## Database Collections
 Database Collections
-Users
+- [ ] Users
 
 full_name: String
 email: String
 password: String (hashed)
 
-PreSurveyAnswers
+- [ ]PreSurveyAnswers
 
 user_id: ObjectId
 answers: Array
 timestamp: DateTime
 
-ProgrammingQ1Answers
+- [ ]ProgrammingQ1Answers
 
 user_id: ObjectId
 code: String
 result: Object
 timestamp: DateTime
 
-FeedbackMatrix
+- [ ]FeedbackMatrix
 
 user_id: ObjectId
 metrics: Object
 comparison_data: Object
 
-PostSurveyAnswers
+- [ ]PostSurveyAnswers
 
 user_id: ObjectId
 answers: Array
 timestamp: DateTime
 
-ProgrammingQ2Answers
+- [ ]ProgrammingQ2Answers
 
 user_id: ObjectId
 code: String
 result: Object
 timestamp: DateTime
 
-Prompts
+- [ ]Prompts
 
 user_id: ObjectId
 question_id: ObjectId
 prompt_text: String
 timestamp: DateTime
 
-AIResponses
+- [ ]AIResponses
 
 prompt_id: ObjectId
 response_text: String
 timestamp: DateTime
 
-UserMetrics
+- [ ]UserMetrics
 
 user_id: ObjectId
 run_button_clicks: Number

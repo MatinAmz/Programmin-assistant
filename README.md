@@ -3,7 +3,7 @@
 ## Features & Tasks
 
 ### Registration System
-- [x ] Create registration form with Flask-WTF
+- [x] Create registration form with Flask-WTF
 - [ ] Add email validation on server side
 - [ ] Implement MongoDB user storage
 - [ ] Add Flask redirect to login

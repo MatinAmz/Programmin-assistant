@@ -49,12 +49,14 @@
   - Flask template rendering
 
 ## Database Collections
-## Database Collections
 
-- [ ] **Users**  
+- [x] **Users**  
   - `full_name`: String  
   - `email`: String  
   - `password`: String (hashed)
+    
+- [ ] **PreSurveyQuestion**  
+
 
 - [ ] **PreSurveyAnswers**  
   - `user_id`: ObjectId  

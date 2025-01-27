@@ -51,65 +51,56 @@
   - Flask template rendering
 
 ## Database Collections
-Database Collections
-- [ ] Users
+## Database Collections
 
-full_name: String
-email: String
-password: String (hashed)
+- [ ] **Users**  
+  - `full_name`: String  
+  - `email`: String  
+  - `password`: String (hashed)
 
-- [ ]PreSurveyAnswers
+- [ ] **PreSurveyAnswers**  
+  - `user_id`: ObjectId  
+  - `answers`: Array  
+  - `timestamp`: DateTime
 
-user_id: ObjectId
-answers: Array
-timestamp: DateTime
+- [ ] **ProgrammingQ1Answers**  
+  - `user_id`: ObjectId  
+  - `code`: String  
+  - `result`: Object  
+  - `timestamp`: DateTime
 
-- [ ]ProgrammingQ1Answers
+- [ ] **FeedbackMatrix**  
+  - `user_id`: ObjectId  
+  - `metrics`: Object  
+  - `comparison_data`: Object
 
-user_id: ObjectId
-code: String
-result: Object
-timestamp: DateTime
+- [ ] **PostSurveyAnswers**  
+  - `user_id`: ObjectId  
+  - `answers`: Array  
+  - `timestamp`: DateTime
 
-- [ ]FeedbackMatrix
+- [ ] **ProgrammingQ2Answers**  
+  - `user_id`: ObjectId  
+  - `code`: String  
+  - `result`: Object  
+  - `timestamp`: DateTime
 
-user_id: ObjectId
-metrics: Object
-comparison_data: Object
+- [ ] **Prompts**  
+  - `user_id`: ObjectId  
+  - `question_id`: ObjectId  
+  - `prompt_text`: String  
+  - `timestamp`: DateTime
 
-- [ ]PostSurveyAnswers
+- [ ] **AIResponses**  
+  - `prompt_id`: ObjectId  
+  - `response_text`: String  
+  - `timestamp`: DateTime
 
-user_id: ObjectId
-answers: Array
-timestamp: DateTime
+- [ ] **UserMetrics**  
+  - `user_id`: ObjectId  
+  - `run_button_clicks`: Number  
+  - `test_case_uses`: Number  
+  - `code_snapshots`: Array of Objects  
+    - `timestamp`: DateTime  
+    - `code_state`: String
 
-- [ ]ProgrammingQ2Answers
-
-user_id: ObjectId
-code: String
-result: Object
-timestamp: DateTime
-
-- [ ]Prompts
-
-user_id: ObjectId
-question_id: ObjectId
-prompt_text: String
-timestamp: DateTime
-
-- [ ]AIResponses
-
-prompt_id: ObjectId
-response_text: String
-timestamp: DateTime
-
-- [ ]UserMetrics
-
-user_id: ObjectId
-run_button_clicks: Number
-test_case_uses: Number
-code_snapshots: Array[{
-timestamp: DateTime,
-code_state: String
-}] 
-programming-assistant

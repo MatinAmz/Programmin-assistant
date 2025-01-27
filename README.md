@@ -15,10 +15,8 @@
 - [x] Add success redirect to pre-survey
 
 ### Pre-Survey Module
-- [ ] Create survey forms with Flask-WTF
-- [ ] Implement question pagination
-- [ ] Add form validation
-- [ ] Set up answer storage in MongoDB
+- [x] Create survey manoally in MongoDB
+- [x] Set up answer storage in MongoDB
 
 ### Programming Assessment
 - [ ] Create code submission form

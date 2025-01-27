@@ -20,8 +20,11 @@
 - [x] Redirect the user to the login page after the password reset is successful, with a message indicating the new password has been sent
 
 ### Pre-Survey Module
-- [x] Create survey manoally in MongoDB
-- [x] Set up answer storage in MongoDB
+- [x] Create HTML structure for the survey page
+- [x] Implement a dynamic form that loops through questions fetched from the database.
+- [x] Back-end route 
+- [x] Store the survey responses along with the user ID and name in the preSurveyAnswers collection.
+- [x]  After submission, redirect the user to programming1 page
 
 ### Programming Assessment
 - [ ] Create code submission form

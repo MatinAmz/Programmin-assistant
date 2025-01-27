@@ -1,7 +1,3 @@
-# Flask & MongoDB Learning Platform
-
-## Features & Tasks
-
 ### Registration System
 - [x] Create registration form with Flask-WTF
 - [x] Add email validation on server side
@@ -11,8 +7,17 @@
 ### Login System
 - [x] Create login form
 - [x] Add server-side authentication
-- [ ] Implement password recovery via email
+- [x] Implement password recovery via email
 - [x] Add success redirect to pre-survey
+
+### Forgot Password
+- [x] Define a ForgotPasswordForm class with an email field
+- [x] forgot_password.html
+- [x] Configure the email settings in app.py
+- [x] Implement email sending logic using Flask-Mail
+- [x]  Generate random password
+- [x] Update the database with the new password after hashing it.
+- [x] Redirect the user to the login page after the password reset is successful, with a message indicating the new password has been sent
 
 ### Pre-Survey Module
 - [x] Create survey manoally in MongoDB

@@ -4,15 +4,15 @@
 
 ### Registration System
 - [x] Create registration form with Flask-WTF
-- [ ] Add email validation on server side
-- [ ] Implement MongoDB user storage
-- [ ] Add Flask redirect to login
+- [x] Add email validation on server side
+- [x] Implement MongoDB user storage
+- [x] Add Flask redirect to login
 
 ### Login System
-- [ ] Create login form
-- [ ] Add server-side authentication
+- [x] Create login form
+- [x] Add server-side authentication
 - [ ] Implement password recovery via email
-- [ ] Add success redirect to pre-survey
+- [x] Add success redirect to pre-survey
 
 ### Pre-Survey Module
 - [ ] Create survey forms with Flask-WTF

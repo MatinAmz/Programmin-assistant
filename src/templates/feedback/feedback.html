@@ -1,10 +1,143 @@
-{# templates/feedback/feedback.html #}
 {% extends 'base.html' %}
-{% block title %}Feedback{% endblock %}
+{% block title %}AI Usage Feedback{% endblock %}
 
 {% block content %}
-<div class="feedback-container">
-    <h2>Feedback</h2>
-    <!-- Add your feedback content here -->
+<!-- Include required Chart.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.7.0/chart.min.js"></script>
+
+<div class="container mx-auto p-6">
+    <h1 class="text-2xl font-bold mb-6">AI Usage Analytics for Question {{ question_id }}</h1>
+
+    <!-- Usage Statistics Cards -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div class="bg-white p-4 rounded-lg shadow">
+            <h3 class="text-lg font-semibold mb-2">Your Total AI Interactions</h3>
+            <p class="text-3xl font-bold text-blue-600">{{ personal_usage_count }}</p>
+        </div>
+        <div class="bg-white p-4 rounded-lg shadow">
+            <h3 class="text-lg font-semibold mb-2">Class Average</h3>
+            <p class="text-3xl font-bold text-green-600">{{ average_usage|round(1) }}</p>
+        </div>
+        <div class="bg-white p-4 rounded-lg shadow">
+            <h3 class="text-lg font-semibold mb-2">Most Active Time</h3>
+            <p class="text-3xl font-bold text-purple-600">{{ most_active_hour }}:00</p>
+        </div>
+    </div>
+
+    <!-- Usage Over Time Chart -->
+    <div class="bg-white p-6 rounded-lg shadow mb-6">
+        <h2 class="text-xl font-semibold mb-4">Your AI Usage Pattern</h2>
+        <canvas id="usageChart" height="100"></canvas>
+    </div>
+
+    <!-- Comparison Chart -->
+    <div class="bg-white p-6 rounded-lg shadow mb-6">
+        <h2 class="text-xl font-semibold mb-4">Usage Comparison with Class</h2>
+        <canvas id="comparisonChart" height="80"></canvas>
+    </div>
+
+    <!-- Usage Details Table -->
+    <div class="bg-white p-6 rounded-lg shadow">
+        <h2 class="text-xl font-semibold mb-4">Recent AI Interactions</h2>
+        <div class="overflow-x-auto">
+            <table class="min-w-full">
+                <thead>
+                    <tr class="bg-gray-100">
+                        <th class="px-4 py-2 text-left">Time</th>
+                        <th class="px-4 py-2 text-left">Prompt</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for interaction in recent_interactions %}
+                    <tr class="border-t">
+                        <td class="px-4 py-2">{{ interaction.timestamp.strftime('%Y-%m-%d %H:%M') }}</td>
+                        <td class="px-4 py-2">{{ interaction.prompt_text[:100] }}...</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
 </div>
+
+<script>
+// Parse the data passed from Flask
+const timeData = {{ time_data|tojson }};
+const comparisonData = {{ comparison_data|tojson }};
+
+// Usage Pattern Chart
+const usageCtx = document.getElementById('usageChart').getContext('2d');
+new Chart(usageCtx, {
+    type: 'line',
+    data: {
+        labels: timeData.labels,
+        datasets: [{
+            label: 'Number of AI Interactions',
+            data: timeData.values,
+            borderColor: 'rgb(59, 130, 246)',
+            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+            fill: true,
+            tension: 0.4
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            legend: {
+                position: 'top',
+            },
+            title: {
+                display: true,
+                text: 'AI Usage Throughout the Day'
+            }
+        },
+        scales: {
+            y: {
+                beginAtZero: true,
+                ticks: {
+                    stepSize: 1
+                }
+            }
+        }
+    }
+});
+
+// Comparison Chart
+const comparisonCtx = document.getElementById('comparisonChart').getContext('2d');
+new Chart(comparisonCtx, {
+    type: 'bar',
+    data: {
+        labels: comparisonData.labels,
+        datasets: [{
+            label: 'AI Interactions',
+            data: comparisonData.values,
+            backgroundColor: [
+                'rgba(59, 130, 246, 0.6)',
+                'rgba(16, 185, 129, 0.6)',
+                'rgba(139, 92, 246, 0.6)',
+            ],
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            legend: {
+                position: 'top',
+            },
+            title: {
+                display: true,
+                text: 'Your Usage vs Class Average'
+            }
+        },
+        scales: {
+            y: {
+                beginAtZero: true,
+                ticks: {
+                    stepSize: 1
+                }
+            }
+        }
+    }
+});
+</script>
 {% endblock %}

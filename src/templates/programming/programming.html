@@ -140,6 +140,7 @@
     <div class="split-container">
         <!-- Code Panel -->
         <div class="code-panel">
+            <!-- Run Code Form -->
             <form id="codeForm" method="POST" action="{{ url_for('programming_run', page_num=page_num) }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                 <textarea
@@ -148,11 +149,15 @@
                     style="display: none;">{{ code if code else 'def solution(a, b):\n    # Write your code here\n    pass' }}</textarea>
                 <div class="button-group">
                     <button type="submit" class="run-btn">Run Code</button>
-                    <form id="submitForm" method="POST" style="display: inline;" action="{{ url_for('programming_submit', page_num=page_num) }}">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
-                        <input type="hidden" name="final_code" id="final_code">
-                        <button type="submit" class="submit-btn">Submit Solution</button>
-                    </form>
+                </div>
+            </form>
+
+            <!-- Submit Solution Form -->
+            <form id="submitForm" method="POST" action="{{ url_for('programming_submit', page_num=page_num) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                <input type="hidden" name="code" id="submit-code">
+                <div class="button-group">
+                    <button type="submit" class="submit-btn">Submit Solution</button>
                 </div>
             </form>
 
@@ -170,8 +175,8 @@
                         {% if result.expected %}
                             <div class="test-detail">Expected: {{ result.expected }}</div>
                         {% endif %}
-                        {% if result.output %}
-                            <div class="test-detail">Output: {{ result.output }}</div>
+                        {% if result.actual %}
+                            <div class="test-detail">Output: {{ result.actual }}</div>
                         {% endif %}
                         {% if result.error %}
                             <div class="test-error">Error: {{ result.error }}</div>
@@ -220,17 +225,17 @@
         styleActiveLine: true
     });
 
-    // Update hidden inputs before form submissions
+    // Update code value before form submissions
     document.getElementById("codeForm").onsubmit = function() {
-        document.getElementById("current-code").value = editor.getValue();
+        document.getElementById("codeEditor").value = editor.getValue();
+    };
+
+    document.getElementById("submitForm").onsubmit = function() {
+        document.getElementById("submit-code").value = editor.getValue();
     };
 
     document.getElementById("promptForm").onsubmit = function() {
         document.getElementById("current-code").value = editor.getValue();
-    };
-
-    document.getElementById("submitForm").onsubmit = function() {
-        document.getElementById("final_code").value = editor.getValue();
     };
 
     // Autosave functionality

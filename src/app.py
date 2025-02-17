@@ -146,31 +146,24 @@ def presurvey():
 
     elif request.method == 'POST':
         try:
-            # Debug prints
             print("Form data:", request.form)
             print("Current user:", current_user.id, current_user.name)
             
             user_id = current_user.id
             user_name = current_user.name
             
-            # Fetch questions and print them
             questions = list(mongo.db.preSurveyQuestion.find())
             print("Questions from DB:", questions)
             
-            # Initialize answers dictionary
             answers = {}
-            
-            # Check each question
             for question in questions:
                 key = f"question_{question['_id']}"
                 answer = request.form.get(key)
-                print(f"Processing {key}: {answer}")  # Debug print
+                print(f"Processing {key}: {answer}")
                 
-                # Only add non-empty answers
                 if answer:
                     answers[key] = answer
             
-            # Check if all questions are answered
             if len(answers) != len(questions):
                 print("Not all questions answered")
                 flash("Please answer all questions.", "error")
@@ -178,15 +171,13 @@ def presurvey():
                                     questions=questions, 
                                     answers=answers)
             
-            # Create submission document
             submission = {
                 'user_id': user_id,
                 'user_name': user_name,
                 'answers': answers,
-                'submitted_at': datetime.datetime.utcnow()
+                'submitted_at': datetime.datetime.now(datetime.UTC)  # Fixed datetime
             }
             
-            # Save to database
             print("Saving submission:", submission)
             mongo.db.preSurveyAnswers.insert_one(submission)
             
@@ -203,13 +194,12 @@ def presurvey():
     return render_template('surveys/preSurvey.html', questions=questions)
 
 
-
 def run_code_with_test_cases(code, test_cases):
     results = []
     
     # Create a temporary file for the code
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        # Add a main block to handle input
+        # Add a main block to handle input based on the existing test cases
         full_code = code + "\n\nif __name__ == '__main__':\n    try:\n        a = int(input())\n        b = int(input())\n        result = solution(a, b)\n        print(result)\n    except Exception as e:\n        print(f'Error: {str(e)}')"
         f.write(full_code)
         temp_file = f.name
@@ -219,27 +209,29 @@ def run_code_with_test_cases(code, test_cases):
             input_data = test_case.get('input', '')
             expected_output = str(test_case.get('expected_output', '')).strip()
             
-            # Run the code with test input
             process = subprocess.Popen(
                 ['python3', temp_file],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=5  # 5 second timeout for safety
+                timeout=5
             )
             
             try:
                 output, error = process.communicate(input=input_data, timeout=5)
                 actual_output = output.strip()
                 
-                # Prepare test result
                 result = {
                     'input': input_data,
                     'expected': expected_output,
                     'actual': actual_output,
-                    'error': error,
+                    'error': error if error else None
                 }
+                
+                # Only include error field if there is an error
+                if not result['error']:
+                    del result['error']
                 
                 if error:
                     result['status'] = 'error'
@@ -261,11 +253,10 @@ def run_code_with_test_cases(code, test_cases):
     except Exception as e:
         results.append({
             'status': 'error',
-            'error': f'Execution error: {str(e)}',
+            'error': f'Execution error: {str(e)}'
         })
     
     finally:
-        # Clean up
         if os.path.exists(temp_file):
             os.unlink(temp_file)
     
@@ -300,113 +291,57 @@ def autosave_code(page_num):
 @app.route('/programming/<page_num>')
 @login_required
 def programming_question(page_num):
-    # Get the question from MongoDB
-    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
-    
-    if not question:
-        return redirect(url_for('error_page'))
-    
-    # First try to get autosaved code
-    autosaved = mongo.db.code_autosaves.find_one({
-        'user_id': current_user.id,
-        'question_id': f'programming_q{page_num}'
-    })
-    
-    # If no autosave exists, try to get submitted code
-    if not autosaved:
-        submitted = mongo.db.submissions.find_one({
+    try:
+        # Get the question from MongoDB using question_id format
+        question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+        print(f"Found question: {question}")  # Debug print
+        
+        if not question:
+            print(f"No question found for programming_q{page_num}")
+            flash('Programming question not found.', 'error')
+            return render_template('programming/programming.html',
+                            question={'question_text': 'Question not found'},
+                            code='',
+                            page_num=page_num)
+        
+        # First try to get autosaved code
+        autosaved = mongo.db.code_autosaves.find_one({
             'user_id': current_user.id,
             'question_id': f'programming_q{page_num}'
         })
-        code = submitted.get('code') if submitted else None
-    else:
-        code = autosaved.get('code')
-    
-    return render_template('programming/programming.html', 
-                         question=question,
-                         code=code,
-                         page_num=page_num)
-
-
-
-# Updated route with fixed code execution
-@app.route('/programming/<page_num>/run', methods=['POST'])
-@login_required
-def programming_run(page_num):
-    code = request.form.get('code')
-    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
-    
-    # Get test cases from the question
-    test_cases = question.get('test_cases', [])
-    test_results = []
-    
-    # Create a temporary file to run the code
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(code)
-        temp_file = f.name
-    
-    try:
-        for test_case in test_cases:
-            # Prepare the test input
-            input_data = test_case.get('input', '')
-            expected_output = test_case.get('expected_output', '').strip()
-            
-            # Run the code with the test input
-            process = subprocess.Popen(
-                ['python3', temp_file],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            try:
-                output, error = process.communicate(input=input_data, timeout=5)
-                
-                if error:
-                    test_results.append({
-                        'status': 'error',
-                        'error': error
-                    })
-                else:
-                    actual_output = output.strip()
-                    if actual_output == expected_output:
-                        test_results.append({
-                            'status': 'passed',
-                            'output': actual_output
-                        })
-                    else:
-                        test_results.append({
-                            'status': 'failed',
-                            'output': actual_output,
-                            'expected': expected_output
-                        })
-            except subprocess.TimeoutExpired:
-                process.kill()
-                test_results.append({
-                    'status': 'error',
-                    'error': 'Code execution timed out'
-                })
-    
+        
+        # If no autosave exists, try to get submitted code
+        if not autosaved:
+            submitted = mongo.db.submissions.find_one({
+                'user_id': current_user.id,
+                'question_id': f'programming_q{page_num}'
+            })
+            code = submitted.get('code') if submitted else ''
+        else:
+            code = autosaved.get('code')
+        
+        # Add test cases if they don't exist
+        if 'test_cases' not in question:
+            question['test_cases'] = [
+                {'input': 'babad', 'expected_output': 'bab'},
+                {'input': 'cbbd', 'expected_output': 'bb'},
+                {'input': 'a', 'expected_output': 'a'},
+                {'input': 'ac', 'expected_output': 'a'}
+            ]
+        
+        return render_template('programming/programming.html',
+                          question=question,
+                          code=code,
+                          page_num=page_num)
+                          
     except Exception as e:
-        test_results.append({
-            'status': 'error',
-            'error': str(e)
-        })
-    
-    finally:
-        # Clean up the temporary file
-        try:
-            os.unlink(temp_file)
-        except:
-            pass
-    
-    return render_template('programming/programming.html', 
-                         question=question,
-                         code=code,
-                         test_results=test_results,
-                         page_num=page_num)
-
+        print(f"Error in programming_question: {str(e)}")
+        traceback.print_exc()
+        flash('Error loading programming question', 'error')
+        return render_template('programming/programming.html',
+                          question={'question_text': 'Error loading question'},
+                          code='',
+                          page_num=page_num)
 
 
 # Load environment variables
@@ -452,16 +387,228 @@ def programming_prompt(page_num):
                          prompt=prompt)
 
 
-
-
-
-@app.route('/feedback')
+@app.route('/programming/<page_num>/run', methods=['POST'])
 @login_required
-def feedback():
-    return render_template('feedback/feedback.html')
+def programming_run(page_num):
+    code = request.form.get('code')
+    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+    
+    # Get test cases from the question
+    test_cases = question.get('test_cases', [])
+    test_results = []
+    
+    # Create a temporary file to run the code
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(code)
+        temp_file = f.name
+    
+    try:
+        for test_case in test_cases:
+            # Prepare the test input
+            input_data = test_case.get('input', '')
+            expected_output = test_case.get('expected_output', '').strip()
+            
+            # Run the code with the test input
+            process = subprocess.Popen(
+                ['python3', temp_file],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            try:
+                output, error = process.communicate(input=input_data, timeout=5)
+                
+                if error:
+                    test_results.append({
+                        'status': 'error',
+                        'error': error
+                    })
+                else:
+                    actual_output = output.strip()
+                    test_results.append({
+                        'input': input_data,
+                        'expected': expected_output,
+                        'actual': actual_output,
+                        'status': 'passed' if actual_output == expected_output else 'failed'
+                    })
+            
+            except subprocess.TimeoutExpired:
+                process.kill()
+                test_results.append({
+                    'status': 'error',
+                    'error': 'Code execution timed out',
+                    'input': input_data
+                })
+    
+    except Exception as e:
+        test_results.append({'status': 'error', 'error': str(e)})
+    
+    finally:
+        if os.path.exists(temp_file):
+            os.unlink(temp_file)
+    
+    # Save submission
+    mongo.db.submissions.insert_one({
+        'user_id': current_user.id,
+        'question_id': f'programming_q{page_num}',
+        'code': code,
+        'test_results': test_results,
+        'submitted_at': datetime.datetime.utcnow()
+    })
+    
+    # Redirect to feedback page after submission
+    return redirect(url_for('programming_question', page_num=page_num))
 
+@app.route('/programming/<page_num>/submit', methods=['POST'])
+@login_required
+def programming_submit(page_num):
+    print(f"Received submission for page {page_num}")  # Add this line right here, at the start
+    try:
+        code = request.form.get('code')
+        question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+        
+        if not question:
+            flash('Question not found', 'error')
+            return redirect(url_for('programming_question', page_num=page_num))
+        
+        # Run final tests
+        test_cases = question.get('test_cases', [])
+        test_results = run_code_with_test_cases(code, test_cases)
+        
+        # Calculate score
+        total_tests = len(test_results)
+        passed_tests = sum(1 for result in test_results if result['status'] == 'passed')
+        score = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
+        
+        # Save submission
+        submission = {
+            'user_id': current_user.id,
+            'question_id': f'programming_q{page_num}',
+            'code': code,
+            'test_results': test_results,
+            'score': score,
+            'timestamp': datetime.datetime.now(datetime.UTC)
+        }
+        
+        # Save to MongoDB using upsert
+        mongo.db.submissions.update_one(
+            {
+                'user_id': current_user.id,
+                'question_id': f'programming_q{page_num}'
+            },
+            {'$set': submission},
+            upsert=True
+        )
+        
+        flash(f'Solution submitted successfully! Score: {score:.1f}%', 'success')
+        
+        # If this was the first question and they passed, go to the next question
+        if page_num == '1' and score >= 80:
+            next_question = mongo.db.programmingQuestions.find_one({'question_id': 'programming_q2'})
+            if next_question:
+                return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
 
-@app.route('/postsurvey')
+        
+        return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
+
+        
+    except Exception as e:
+        print("Error in submit:", str(e))
+        traceback.print_exc()
+        flash('Error submitting solution', 'error')
+        return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
+
+@app.route('/feedback/<question_id>')
+@login_required
+def feedback(question_id):
+    try:
+        # Get personal usage count
+        personal_usage_count = mongo.db.ai_interactions.count_documents({
+            'user_id': current_user.id,
+            'question_id': f'programming_q{question_id}'
+        })
+
+        # Get usage by hour for time series
+        pipeline = [
+            {
+                '$match': {
+                    'user_id': current_user.id,
+                    'question_id': f'programming_q{question_id}'
+                }
+            },
+            {
+                '$group': {
+                    '_id': {
+                        '$hour': '$timestamp'
+                    },
+                    'count': {'$sum': 1}
+                }
+            },
+            {'$sort': {'_id': 1}}
+        ]
+        
+        hourly_usage = list(mongo.db.ai_interactions.aggregate(pipeline))
+        
+        # Prepare data for template
+        time_data = {
+            'labels': [f'{h:02d}:00' for h in range(24)],
+            'values': [0] * 24
+        }
+        
+        for item in hourly_usage:
+            time_data['values'][item['_id']] = item['count']
+
+        # Get recent interactions
+        recent_interactions = list(mongo.db.ai_interactions.find({
+            'user_id': current_user.id,
+            'question_id': f'programming_q{question_id}'
+        }).sort('timestamp', -1).limit(5))
+
+        # Get the class average usage
+        class_usage_pipeline = [
+            {
+                '$match': {
+                    'question_id': f'programming_q{question_id}'
+                }
+            },
+            {
+                '$group': {
+                    '_id': '$user_id',
+                    'total_count': {'$sum': 1}
+                }
+            }
+        ]
+        class_usage = list(mongo.db.ai_interactions.aggregate(class_usage_pipeline))
+        total_class_interactions = sum([entry['total_count'] for entry in class_usage])
+        average_usage = total_class_interactions / len(class_usage) if len(class_usage) > 0 else 0
+
+        # Get most active hour (class level)
+        most_active_hour = max(hourly_usage, key=lambda x: x['count'])['_id'] if hourly_usage else 0
+
+        # Prepare comparison data for chart
+        comparison_data = {
+            'labels': ['Your Usage', 'Class Average'],
+            'values': [personal_usage_count, average_usage]
+        }
+
+        return render_template('feedback/feedback.html',
+            question_id=question_id,
+            personal_usage_count=personal_usage_count,
+            time_data=time_data,
+            recent_interactions=recent_interactions,
+            comparison_data=comparison_data,
+            average_usage=average_usage,
+            most_active_hour=most_active_hour
+        )
+
+    except Exception as e:
+        print(f"Error in feedback route: {str(e)}")
+        flash('Error loading feedback data', 'error')
+        return render_template('feedback/feedback.html', question_id=question_id)
+
+@app.route('/postSurvey')
 @login_required
 def postsurvey():
    return render_template('survey/post_survey.html')

@@ -6,64 +6,89 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.7.0/chart.min.js"></script>
 
 <div class="container mx-auto p-6">
-    <h1 class="text-2xl font-bold mb-6">AI Usage Analytics for Question {{ question_id }}</h1>
+    <h1 class="text-2xl font-bold mb-6">AI Usage Feedback</h1>
 
-    <!-- Usage Statistics Cards -->
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        <div class="bg-white p-4 rounded-lg shadow">
-            <h3 class="text-lg font-semibold mb-2">Your Total AI Interactions</h3>
-            <p class="text-3xl font-bold text-blue-600">{{ personal_usage_count }}</p>
-        </div>
-        <div class="bg-white p-4 rounded-lg shadow">
-            <h3 class="text-lg font-semibold mb-2">Class Average</h3>
-            <p class="text-3xl font-bold text-green-600">{{ average_usage|round(1) }}</p>
-        </div>
-        <div class="bg-white p-4 rounded-lg shadow">
-            <h3 class="text-lg font-semibold mb-2">Most Active Time</h3>
-            <p class="text-3xl font-bold text-purple-600">{{ most_active_hour }}:00</p>
+    <!-- Usage Percentage Card -->
+    <div class="bg-white p-6 rounded-lg shadow mb-6">
+        <div class="flex items-center justify-center">
+            <div class="text-center">
+                <h2 class="text-xl font-semibold mb-2">Your AI Usage Compared to Others</h2>
+                <div class="relative w-10 h-10 mx-auto">
+                    <svg viewBox="0 0 500 100" class="w-full h-full">
+                        <!-- Background circle -->
+                        <circle 
+                            cx="50" cy="50" r="45" 
+                            fill="none" 
+                            stroke="#e6e6e6" 
+                            stroke-width="10" 
+                        />
+                        
+                        <!-- Progress circle -->
+                        <circle 
+                            cx="50" cy="50" r="45" 
+                            fill="none" 
+                            stroke="{% if usage_percentage|default(0) > 100 %}#ef4444{% else %}#3b82f6{% endif %}" 
+                            stroke-width="10" 
+                            stroke-dasharray="{% if usage_percentage|default(0) > 100 %}283{% else %}{{ (usage_percentage|default(0) * 2.83)|round(1) }}{% endif %} 283" 
+                            stroke-dashoffset="0" 
+                            stroke-linecap="round" 
+                            transform="rotate(-90 50 50)" 
+                        />
+                        
+                        <!-- Percentage text -->
+                        <text 
+                            x="50" y="45" 
+                            text-anchor="middle" 
+                            dominant-baseline="middle" 
+                            font-weight="bold"
+                            font-size="18"
+                            fill="{% if usage_percentage|default(0) > 100 %}#ef4444{% else %}#3b82f6{% endif %}"
+                        >
+                            {{ usage_percentage|default(0)|round(0) }}%
+                        </text>
+                        
+                        <text 
+                            x="50" y="65" 
+                            text-anchor="middle" 
+                            dominant-baseline="middle" 
+                            font-size="8"
+                            fill="#666"
+                        >
+                            of class average
+                        </text>
+                    </svg>
+                </div>
+                <p class="mt-4 text-gray-700">
+                    {% if usage_percentage|default(0) < 80 %}
+                        You used AI less than most students on this question.
+                    {% elif usage_percentage|default(0) > 120 %}
+                        You used AI more frequently than most students.
+                    {% else %}
+                        Your AI usage is similar to other students.
+                    {% endif %}
+                </p>
+            </div>
         </div>
     </div>
 
     <!-- Usage Over Time Chart -->
     <div class="bg-white p-6 rounded-lg shadow mb-6">
-        <h2 class="text-xl font-semibold mb-4">Your AI Usage Pattern</h2>
+        <h2 class="text-xl font-semibold mb-4">Your AI Usage During the Session</h2>
         <canvas id="usageChart" height="100"></canvas>
     </div>
 
-    <!-- Comparison Chart -->
-    <div class="bg-white p-6 rounded-lg shadow mb-6">
-        <h2 class="text-xl font-semibold mb-4">Usage Comparison with Class</h2>
-        <canvas id="comparisonChart" height="80"></canvas>
-    </div>
-
-    <!-- Usage Details Table -->
-    <div class="bg-white p-6 rounded-lg shadow">
-        <h2 class="text-xl font-semibold mb-4">Recent AI Interactions</h2>
-        <div class="overflow-x-auto">
-            <table class="min-w-full">
-                <thead>
-                    <tr class="bg-gray-100">
-                        <th class="px-4 py-2 text-left">Time</th>
-                        <th class="px-4 py-2 text-left">Prompt</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for interaction in recent_interactions %}
-                    <tr class="border-t">
-                        <td class="px-4 py-2">{{ interaction.timestamp.strftime('%Y-%m-%d %H:%M') }}</td>
-                        <td class="px-4 py-2">{{ interaction.prompt_text[:100] }}...</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
+    <!-- Navigation Buttons -->
+    <div class="mt-8 text-center">
+        <a href="{{ url_for('programming_question', page_num=next_page_num) }}" 
+           class="bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow">
+            Continue to Next Question
+        </a>
     </div>
 </div>
 
 <script>
-// Parse the data passed from Flask
-const timeData = {{ time_data|tojson }};
-const comparisonData = {{ comparison_data|tojson }};
+// Parse the data passed from Flask with fallbacks
+const timeData = {{ time_data|default({'labels':[], 'values':[]})|tojson }};
 
 // Usage Pattern Chart
 const usageCtx = document.getElementById('usageChart').getContext('2d');
@@ -88,52 +113,24 @@ new Chart(usageCtx, {
             },
             title: {
                 display: true,
-                text: 'AI Usage Throughout the Day'
+                text: 'AI Usage During Session (5-minute intervals)'
             }
         },
         scales: {
-            y: {
-                beginAtZero: true,
-                ticks: {
-                    stepSize: 1
+            x: {
+                title: {
+                    display: true,
+                    text: 'Minutes into session'
                 }
-            }
-        }
-    }
-});
-
-// Comparison Chart
-const comparisonCtx = document.getElementById('comparisonChart').getContext('2d');
-new Chart(comparisonCtx, {
-    type: 'bar',
-    data: {
-        labels: comparisonData.labels,
-        datasets: [{
-            label: 'AI Interactions',
-            data: comparisonData.values,
-            backgroundColor: [
-                'rgba(59, 130, 246, 0.6)',
-                'rgba(16, 185, 129, 0.6)',
-                'rgba(139, 92, 246, 0.6)',
-            ],
-        }]
-    },
-    options: {
-        responsive: true,
-        plugins: {
-            legend: {
-                position: 'top',
             },
-            title: {
-                display: true,
-                text: 'Your Usage vs Class Average'
-            }
-        },
-        scales: {
             y: {
                 beginAtZero: true,
                 ticks: {
                     stepSize: 1
+                },
+                title: {
+                    display: true,
+                    text: 'Number of interactions'
                 }
             }
         }

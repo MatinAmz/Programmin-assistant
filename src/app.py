@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash,jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_pymongo import PyMongo
 from flask_login import LoginManager, UserMixin, current_user, login_user, logout_user, login_required
 from itsdangerous import SignatureExpired
@@ -106,7 +106,6 @@ def login():
    return render_template('auth/login.html', title='Login', form=form)
 
 
-
 @app.route('/forgot-password', methods=['GET', 'POST'])
 def forgot_password():
     form = ForgotPasswordForm()
@@ -175,7 +174,7 @@ def presurvey():
                 'user_id': user_id,
                 'user_name': user_name,
                 'answers': answers,
-                'submitted_at': datetime.datetime.now(datetime.UTC)  # Fixed datetime
+                'submitted_at': datetime.datetime.now(datetime.UTC)
             }
             
             print("Saving submission:", submission)
@@ -464,7 +463,7 @@ def programming_run(page_num):
 @app.route('/programming/<page_num>/submit', methods=['POST'])
 @login_required
 def programming_submit(page_num):
-    print(f"Received submission for page {page_num}")  # Add this line right here, at the start
+    print(f"Received submission for page {page_num}")
     try:
         code = request.form.get('code')
         question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
@@ -504,103 +503,118 @@ def programming_submit(page_num):
         
         flash(f'Solution submitted successfully! Score: {score:.1f}%', 'success')
         
-        # If this was the first question and they passed, go to the next question
-        if page_num == '1' and score >= 80:
-            next_question = mongo.db.programmingQuestions.find_one({'question_id': 'programming_q2'})
-            if next_question:
-                return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
-
-        
-        return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
-
+        # For question 2, redirect directly to post-survey
+        if page_num == '2':
+            return redirect(url_for('postsurvey'))
+        # For question 1, show feedback
+        else:
+            return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
         
     except Exception as e:
         print("Error in submit:", str(e))
         traceback.print_exc()
         flash('Error submitting solution', 'error')
-        return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
+        
+        # For question 2, redirect directly to post-survey even on error
+        if page_num == '2':
+            return redirect(url_for('postsurvey'))
+        else:
+            return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
 
 @app.route('/feedback/<question_id>')
 @login_required
 def feedback(question_id):
     try:
-        # Get personal usage count
+        # Get real personal usage count
         personal_usage_count = mongo.db.ai_interactions.count_documents({
             'user_id': current_user.id,
-            'question_id': f'programming_q{question_id}'
+            'question_id': question_id
         })
 
-        # Get usage by hour for time series
-        pipeline = [
-            {
-                '$match': {
-                    'user_id': current_user.id,
-                    'question_id': f'programming_q{question_id}'
-                }
-            },
-            {
-                '$group': {
-                    '_id': {
-                        '$hour': '$timestamp'
-                    },
-                    'count': {'$sum': 1}
-                }
-            },
-            {'$sort': {'_id': 1}}
-        ]
+        # Generate a random percentage for comparison (between 50% and 150%)
+        import random
+        usage_percentage = random.randint(50, 150)
         
-        hourly_usage = list(mongo.db.ai_interactions.aggregate(pipeline))
+        # Create time-based data for the 1-hour session (real data)
+        # We'll use 5-minute intervals (12 intervals in an hour)
+        time_intervals = ['0:00', '5:00', '10:00', '15:00', '20:00', '25:00', 
+                         '30:00', '35:00', '40:00', '45:00', '50:00', '55:00']
         
-        # Prepare data for template
-        time_data = {
-            'labels': [f'{h:02d}:00' for h in range(24)],
-            'values': [0] * 24
-        }
-        
-        for item in hourly_usage:
-            time_data['values'][item['_id']] = item['count']
-
-        # Get recent interactions
-        recent_interactions = list(mongo.db.ai_interactions.find({
+        # Get real interaction data
+        interactions = list(mongo.db.ai_interactions.find({
             'user_id': current_user.id,
-            'question_id': f'programming_q{question_id}'
-        }).sort('timestamp', -1).limit(5))
-
-        # Get the class average usage
-        class_usage_pipeline = [
-            {
-                '$match': {
-                    'question_id': f'programming_q{question_id}'
-                }
-            },
-            {
-                '$group': {
-                    '_id': '$user_id',
-                    'total_count': {'$sum': 1}
-                }
-            }
-        ]
-        class_usage = list(mongo.db.ai_interactions.aggregate(class_usage_pipeline))
-        total_class_interactions = sum([entry['total_count'] for entry in class_usage])
-        average_usage = total_class_interactions / len(class_usage) if len(class_usage) > 0 else 0
-
-        # Get most active hour (class level)
-        most_active_hour = max(hourly_usage, key=lambda x: x['count'])['_id'] if hourly_usage else 0
-
-        # Prepare comparison data for chart
-        comparison_data = {
-            'labels': ['Your Usage', 'Class Average'],
-            'values': [personal_usage_count, average_usage]
+            'question_id': question_id
+        }).sort('timestamp', 1))
+        
+        # Initialize counts for each interval
+        interval_counts = [0] * len(time_intervals)
+        
+        # Same logic as before to distribute interactions into intervals
+        if interactions:
+            try:
+                submission = mongo.db.submissions.find_one({
+                    'user_id': current_user.id,
+                    'question_id': question_id
+                })
+                
+                if submission:
+                    end_time = submission['timestamp']
+                    start_time = end_time - datetime.timedelta(hours=1)
+                else:
+                    start_time = interactions[0]['timestamp']
+                    end_time = start_time + datetime.timedelta(hours=1)
+                
+                for interaction in interactions:
+                    timestamp = interaction['timestamp']
+                    if timestamp < start_time or timestamp > end_time:
+                        continue
+                        
+                    minutes_from_start = (timestamp - start_time).total_seconds() / 60
+                    interval_index = min(int(minutes_from_start / 5), 11)
+                    interval_counts[interval_index] += 1
+                    
+            except Exception as e:
+                print(f"Error processing interaction times: {e}")
+        
+        # Prepare time data for template
+        time_data = {
+            'labels': time_intervals,
+            'values': interval_counts
         }
+        
+        # Set the next page to programming question 2
+        # Since we're only showing feedback for question 1
+        next_url = url_for('programming_question', page_num=2)
+        next_page_num = '2'
+        
+        # Save feedback data to MongoDB for this user
+        feedback_data = {
+            'user_id': current_user.id,
+            'question_id': question_id,
+            'timestamp': datetime.datetime.now(datetime.UTC),
+            'personal_usage_count': personal_usage_count,
+            'usage_percentage': usage_percentage,
+            'time_data': time_data
+        }
+        
+        # Save to MongoDB using upsert
+        mongo.db.feedback.update_one(
+            {
+                'user_id': current_user.id,
+                'question_id': question_id
+            },
+            {'$set': feedback_data},
+            upsert=True
+        )
 
+        # Include next_url in the template context so it can be used in buttons
         return render_template('feedback/feedback.html',
             question_id=question_id,
             personal_usage_count=personal_usage_count,
+            usage_percentage=usage_percentage,
             time_data=time_data,
-            recent_interactions=recent_interactions,
-            comparison_data=comparison_data,
-            average_usage=average_usage,
-            most_active_hour=most_active_hour
+            next_page_num=next_page_num,
+            next_url=next_url
         )
 
     except Exception as e:
@@ -608,10 +622,74 @@ def feedback(question_id):
         flash('Error loading feedback data', 'error')
         return render_template('feedback/feedback.html', question_id=question_id)
 
-@app.route('/postSurvey')
+@app.route('/postSurvey', methods=['GET', 'POST'])
 @login_required
 def postsurvey():
-   return render_template('survey/post_survey.html')
+    if request.method == 'GET':
+        questions = list(mongo.db.postSurveyQuestion.find())
+        return render_template('surveys/postSurvey.html', questions=questions)
+    
+    elif request.method == 'POST':
+        try:
+            print("Form data:", request.form)
+            print("Current user:", current_user.id, current_user.name)
+            
+            user_id = current_user.id
+            user_name = current_user.name
+            
+            questions = list(mongo.db.postSurveyQuestion.find())
+            print("Questions from DB:", questions)
+            
+            answers = {}
+            for question in questions:
+                key = f"question_{question['_id']}"
+                answer = request.form.get(key)
+                print(f"Processing {key}: {answer}")
+                
+                if answer:
+                    answers[key] = answer
+            
+            if len(answers) != len(questions):
+                print("Not all questions answered")
+                flash("Please answer all questions.", "error")
+                return render_template('surveys/postSurvey.html',
+                                      questions=questions,
+                                      answers=answers)
+            
+            submission = {
+                'user_id': user_id,
+                'user_name': user_name,
+                'answers': answers,
+                'submitted_at': datetime.datetime.now(datetime.UTC)
+            }
+            
+            print("Saving submission:", submission)
+            mongo.db.postSurveyAnswers.insert_one(submission)
+            
+            # Update user status to indicate completion of the entire process
+            mongo.db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.UTC)}}
+            )
+            
+            flash("Thank you for completing the survey! Your participation has been recorded.")
+            return redirect(url_for('completion_page'))  # Final thank you/completion page
+            
+        except Exception as e:
+            print("Error in postSurvey:", str(e))
+            print("Full error:", traceback.format_exc())
+            flash("An error occurred. Please try again.")
+            return render_template('surveys/postSurvey.html',
+                                  questions=questions)
+    
+    return render_template('surveys/postSurvey.html', questions=questions)
+
+@app.route('/completion')
+@login_required
+def completion_page():
+    return render_template('completion.html', 
+                          user_name=current_user.name,
+                          now=datetime.datetime.now())
 
 if __name__ == '__main__':
    app.run(debug=True)

@@ -1,0 +1,89 @@
+{% extends 'base.html' %}
+{% block title %}Completion{% endblock %}
+
+{% block content %}
+<div class="completion-container">
+    <div class="completion-card">
+        <div class="check-icon">
+            <i class="fas fa-check-circle"></i>
+        </div>
+        
+        <h2 class="completion-title">Thank You, {{ user_name }}!</h2>
+        
+        <div class="completion-message">
+            <p>You have successfully completed all parts of this study.</p>
+            <p>Your responses have been recorded and will contribute to our research.</p>
+            <p>We appreciate your participation and valuable input!</p>
+        </div>
+        
+        <div class="completion-details">
+            <p>Your participation is now complete. You may close this window.</p>
+            <p class="date-completed">Completed on: {{ now.strftime('%B %d, %Y at %I:%M %p') }}</p>
+        </div>
+        
+    </div>
+</div>
+
+<style>
+.completion-container {
+    max-width: 800px;
+    margin: 50px auto;
+    padding: 20px;
+}
+
+.completion-card {
+    background-color: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    padding: 30px;
+    text-align: center;
+}
+
+.check-icon {
+    font-size: 64px;
+    color: #28a745;
+    margin-bottom: 20px;
+}
+
+.completion-title {
+    font-size: 28px;
+    color: #333;
+    margin-bottom: 20px;
+}
+
+.completion-message {
+    margin-bottom: 30px;
+    font-size: 18px;
+    line-height: 1.6;
+    color: #555;
+}
+
+.completion-details {
+    margin-bottom: 30px;
+    padding: 15px;
+    background-color: #f8f9fa;
+    border-radius: 6px;
+}
+
+.date-completed {
+    font-style: italic;
+    color: #6c757d;
+    margin-top: 10px;
+}
+
+.contact-info {
+    margin-bottom: 30px;
+    font-size: 16px;
+    color: #666;
+}
+
+.contact-info a {
+    color: #007bff;
+    text-decoration: none;
+}
+
+.contact-info a:hover {
+    text-decoration: underline;
+}
+</style>
+{% endblock %}

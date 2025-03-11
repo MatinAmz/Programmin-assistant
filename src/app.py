@@ -398,14 +398,36 @@ def programming_run(page_num):
     
     # Create a temporary file to run the code
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(code)
+        # Determine the right wrapper code based on question type
+        if page_num == '1':  # Addition question
+            full_code = code + """
+if __name__ == '__main__':
+    try:
+        a = int(input())
+        b = int(input())
+        result = solution(a, b)
+        print(result)
+    except Exception as e:
+        print(f'Error: {str(e)}')
+"""
+        else:  # Palindrome question
+            full_code = code + """
+if __name__ == '__main__':
+    try:
+        s = input().strip()
+        result = solution(s)
+        print(result)
+    except Exception as e:
+        print(f'Error: {str(e)}')
+"""
+        f.write(full_code)
         temp_file = f.name
     
     try:
         for test_case in test_cases:
             # Prepare the test input
             input_data = test_case.get('input', '')
-            expected_output = test_case.get('expected_output', '').strip()
+            expected_output = str(test_case.get('expected_output', '')).strip()
             
             # Run the code with the test input
             process = subprocess.Popen(
@@ -422,6 +444,7 @@ def programming_run(page_num):
                 if error:
                     test_results.append({
                         'status': 'error',
+                        'input': input_data,
                         'error': error
                     })
                 else:
@@ -442,7 +465,10 @@ def programming_run(page_num):
                 })
     
     except Exception as e:
-        test_results.append({'status': 'error', 'error': str(e)})
+        test_results.append({
+            'status': 'error', 
+            'error': str(e)
+        })
     
     finally:
         if os.path.exists(temp_file):
@@ -457,8 +483,13 @@ def programming_run(page_num):
         'submitted_at': datetime.datetime.utcnow()
     })
     
-    # Redirect to feedback page after submission
-    return redirect(url_for('programming_question', page_num=page_num))
+    # Return to the same page with test results instead of redirect
+    # This way the user can see their test results
+    return render_template('programming/programming.html',
+                         question=question,
+                         code=code,
+                         page_num=page_num,
+                         test_results=test_results)
 
 @app.route('/programming/<page_num>/submit', methods=['POST'])
 @login_required
@@ -530,10 +561,14 @@ def feedback(question_id):
             'user_id': current_user.id,
             'question_id': question_id
         })
-
-        # Generate a random percentage for comparison (between 50% and 150%)
+        
+        # If user never used AI, set usage percentage to 0
+        # Otherwise, generate a random percentage for comparison
         import random
-        usage_percentage = random.randint(40, 90)
+        if personal_usage_count == 0:
+            usage_percentage = 0
+        else:
+            usage_percentage = random.randint(40, 90)
         
         # Create time-based data for the 1-hour session (real data)
         # We'll use 5-minute intervals (12 intervals in an hour)
@@ -549,7 +584,7 @@ def feedback(question_id):
         # Initialize counts for each interval
         interval_counts = [0] * len(time_intervals)
         
-        # Same logic as before to distribute interactions into intervals
+        # Process interactions into intervals
         if interactions:
             try:
                 submission = mongo.db.submissions.find_one({

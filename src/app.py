@@ -533,7 +533,7 @@ def feedback(question_id):
 
         # Generate a random percentage for comparison (between 50% and 150%)
         import random
-        usage_percentage = random.randint(50, 150)
+        usage_percentage = random.randint(40, 90)
         
         # Create time-based data for the 1-hour session (real data)
         # We'll use 5-minute intervals (12 intervals in an hour)

@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import Flask,Blueprint, render_template, request, redirect, url_for, flash, jsonify, make_response
 from flask_pymongo import PyMongo
 from flask_login import LoginManager, UserMixin, current_user, login_user, logout_user, login_required
 from itsdangerous import SignatureExpired
@@ -20,13 +20,15 @@ import datetime
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFProtect, generate_csrf,validate_csrf
+from flask_cors import CORS
 
 
 
-csrf = CSRFProtect()
 app = Flask(__name__)
-csrf = CSRFProtect(app)
+
+CORS(app,supports_credentials=True, resources={r"/api/*": {"origins": "http://localhost:8080"}})  # Allow Vue.js frontend (assuming it's running on localhost:8080)
+
 
 app.config['MONGO_DBNAME'] = 'webapp'
 app.config['SECRET_KEY'] = '***REDACTED-FLASK-SECRET-KEY***'
@@ -38,6 +40,10 @@ app.config['MAIL_PASSWORD'] = '***REDACTED-GMAIL-APP-PASSWORD***'
 app.config['MAIL_USE_TLS'] = False
 app.config['MAIL_USE_SSL'] = True
 
+csrf = CSRFProtect(app) 
+
+api_bp = Blueprint('api', __name__)
+csrf.exempt(api_bp)
 
 mail = Mail(app)
 # Setup for token generation for password reset
@@ -347,6 +353,7 @@ def programming_question(page_num):
 load_dotenv()
 
 # Initialize OpenAI client
+# client = OpenAI(api_key="")
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 @app.route('/programming/<page_num>/prompt', methods=['POST'])
@@ -725,6 +732,80 @@ def completion_page():
     return render_template('completion.html', 
                           user_name=current_user.name,
                           now=datetime.datetime.now())
+
+
+
+
+@api_bp.route('/get-csrf-token', methods=['GET'])
+def get_csrf():
+    csrf_token = generate_csrf()  # Generate the CSRF token
+    response = make_response(jsonify({"csrf_token": csrf_token}))
+    response.set_cookie('csrf_token', csrf_token, httponly=False, samesite='Lax')
+    return response
+
+@api_bp.route('/register', methods=['POST'])
+def api_register():
+    data = request.get_json()
+    if not data:
+        return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
+
+    name = data.get('name')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not name or not email or not password:
+        return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
+
+    existing_user = mongo.db.users.find_one({'email': email})
+    if existing_user:
+        return jsonify({'status': 'error', 'message': 'Email already exists. Please login.'}), 400
+
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    user = {
+        'name': name,
+        'email': email,
+        'password': hashed_password.decode('utf-8')
+    }
+    result = mongo.db.users.insert_one(user)
+    new_user = mongo.db.users.find_one({'_id': result.inserted_id})
+
+    return jsonify({
+        'status': 'success',
+        'message': 'Registration successful!',
+        'user': {
+            'id': str(new_user['_id']),
+            'name': new_user['name'],
+            'email': new_user['email']
+        }
+    }), 201
+
+@api_bp.route('/login', methods=['POST'])
+def api_login():
+    data = request.get_json()
+    if not data:
+        return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
+    email = data.get('email')
+    password = data.get('password')
+    if not email or not password:
+        return jsonify({'status': 'error', 'message': 'Missing email or password'}), 400
+
+    user = mongo.db.users.find_one({'email': email})
+    if user and bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+        user_obj = User(user)
+        login_user(user_obj)
+        return jsonify({
+            'status': 'success',
+            'message': 'Login successful!',
+            'user': {
+                'id': user_obj.id,
+                'name': user_obj.name,
+                'email': user['email']
+            }
+        })
+    else:
+        return jsonify({'status': 'error', 'message': 'Invalid email or password'}), 401
+
+app.register_blueprint(api_bp, url_prefix='/api')
 
 if __name__ == '__main__':
    app.run(debug=True)

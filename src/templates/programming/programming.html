@@ -239,23 +239,35 @@
     };
 
     // Autosave functionality
-    let saveTimeout;
-    function autosaveCode() {
-        const code = editor.getValue();
-        fetch(`/programming/{{ page_num }}/autosave`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-CSRF-TOKEN': '{{ csrf_token() }}'
-            },
-            body: JSON.stringify({ code: code })
-        });
-    }
-
-    // Set up auto-save on code changes
-    editor.on('change', () => {
-        if (saveTimeout) clearTimeout(saveTimeout);
-        saveTimeout = setTimeout(autosaveCode, 20000); // 20 seconds
+// Autosave functionality
+let saveTimeout;
+function autosaveCode() {
+    const code = editor.getValue();
+    fetch(`/programming/{{ page_num }}/autosave`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-TOKEN': '{{ csrf_token() }}'
+        },
+        body: JSON.stringify({ code: code })
+    })
+    .then(response => {
+        console.log('Autosaved at', new Date().toLocaleTimeString());
+    })
+    .catch(error => {
+        console.error('Error during autosave:', error);
     });
+}
+
+// Set up auto-save on code changes
+editor.on('change', () => {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(autosaveCode, 20000); // 
+});
+
+// Also save when page is about to unload
+window.addEventListener('beforeunload', function() {
+    autosaveCode(); // Save one final time before leaving
+});
 </script>
 {% endblock %}

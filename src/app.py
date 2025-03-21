@@ -54,6 +54,78 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 
+
+def initialize_user_activities_collection():
+    with app.app_context():
+        if 'user_activities' not in mongo.db.list_collection_names():
+            mongo.db.create_collection('user_activities')
+            # Create indexes for faster queries
+            mongo.db.user_activities.create_index([('user_id', 1)])
+            mongo.db.user_activities.create_index([('activity', 1)])
+
+initialize_user_activities_collection()
+
+def track_activity_start(user_id, activity):
+    """Record when a user starts an activity"""
+    current_time = datetime.datetime.utcnow()
+    
+    # Check if there's an existing unfinished activity record
+    existing = mongo.db.user_activities.find_one({
+        'user_id': user_id,
+        'activity': activity,
+        'end_time': None  # Unfinished activity
+    })
+    
+    if existing:
+        # Update existing record if it exists but wasn't properly closed
+        mongo.db.user_activities.update_one(
+            {'_id': existing['_id']},
+            {'$set': {'start_time': current_time}}
+        )
+    else:
+        # Create new activity record
+        mongo.db.user_activities.insert_one({
+            'user_id': user_id,
+            'activity': activity,
+            'start_time': current_time,
+            'end_time': None
+        })
+
+def track_activity_end(user_id, activity):
+    """Record when a user finishes an activity"""
+    current_time = datetime.datetime.utcnow()
+    
+    # Find the most recent unfinished activity for this user and activity
+    activity_record = mongo.db.user_activities.find_one(
+        {
+            'user_id': user_id,
+            'activity': activity,
+            'end_time': None  # Unfinished activity
+        },
+        sort=[('start_time', -1)]  # Get the most recent
+    )
+    
+    if activity_record:
+        # Calculate duration
+        start_time = activity_record['start_time']
+        duration_seconds = (current_time - start_time).total_seconds()
+        duration_minutes = duration_seconds / 60
+        
+        # Update the record with end time and duration
+        mongo.db.user_activities.update_one(
+            {'_id': activity_record['_id']},
+            {
+                '$set': {
+                    'end_time': current_time,
+                    'duration_seconds': duration_seconds,
+                    'duration_minutes': duration_minutes
+                }
+            }
+        )
+
+
+
+
 # Create users collection
 with app.app_context():
    if 'users' not in mongo.db.list_collection_names():
@@ -146,6 +218,7 @@ def forgot_password():
 @login_required
 def presurvey():
     if request.method == 'GET':
+        track_activity_start(current_user.id, 'presurvey')
         questions = list(mongo.db.preSurveyQuestion.find())
         return render_template('surveys/preSurvey.html', questions=questions)
 
@@ -186,7 +259,7 @@ def presurvey():
             print("Saving submission:", submission)
             mongo.db.preSurveyAnswers.insert_one(submission)
             
-            flash("Survey submitted successfully!")
+            track_activity_end(current_user.id, 'presurvey')
             return redirect(url_for('programming_question', page_num=1))
             
         except Exception as e:
@@ -272,24 +345,24 @@ def run_code_with_test_cases(code, test_cases):
 def autosave_code(page_num):
     try:
         code = request.json.get('code')
+        current_time = datetime.datetime.utcnow()
         
-        # Save to autosaves collection
-        mongo.db.code_autosaves.update_one(
-            {
-                'user_id': current_user.id,
-                'question_id': f'programming_q{page_num}'
-            },
-            {
-                '$set': {
-                    'code': code,
-                    'last_saved': datetime.datetime.utcnow()
-                }
-            },
-            upsert=True
-        )
+        # Create a new document for each autosave to maintain history
+        autosave_doc = {
+            'user_id': current_user.id,
+            'question_id': f'programming_q{page_num}',
+            'code': code,
+            'saved_at': current_time
+        }
+        
+        # Insert a new document for each autosave
+        mongo.db.code_autosaves.insert_one(autosave_doc)
+        
+        # Don't update any "latest" collection since we don't want to retrieve this code
         
         return jsonify({'status': 'success', 'message': 'Code auto-saved'})
     except Exception as e:
+        print(f"Autosave error: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
     
 
@@ -297,6 +370,8 @@ def autosave_code(page_num):
 @login_required
 def programming_question(page_num):
     try:
+
+        track_activity_start(current_user.id, f'programming_q{page_num}')
         # Get the question from MongoDB using question_id format
         question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
         print(f"Found question: {question}")  # Debug print
@@ -539,7 +614,7 @@ def programming_submit(page_num):
             upsert=True
         )
         
-        flash(f'Solution submitted successfully! Score: {score:.1f}%', 'success')
+        track_activity_end(current_user.id, f'programming_q{page_num}')
         
         # For question 2, redirect directly to post-survey
         if page_num == '2':
@@ -668,6 +743,7 @@ def feedback(question_id):
 @login_required
 def postsurvey():
     if request.method == 'GET':
+        track_activity_start(current_user.id, 'postsurvey')
         questions = list(mongo.db.postSurveyQuestion.find())
         return render_template('surveys/postSurvey.html', questions=questions)
     
@@ -705,9 +781,9 @@ def postsurvey():
                 'submitted_at': datetime.datetime.now(datetime.UTC)
             }
             
-            print("Saving submission:", submission)
+           
             mongo.db.postSurveyAnswers.insert_one(submission)
-            
+            track_activity_end(current_user.id, 'postsurvey')
             # Update user status to indicate completion of the entire process
             mongo.db.users.update_one(
                 {'_id': ObjectId(user_id)},

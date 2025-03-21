@@ -27,10 +27,10 @@
                             <input type="radio" 
                                    id="q{{ question._id }}_{{ loop.index }}" 
                                    name="question_{{ question._id }}" 
-                                   value="{{ option }}"
+                                   value="{{ option if option is string else option.value }}"
                                    required
-                                   {% if answers and answers['question_' ~ question._id] == option %}checked{% endif %}>
-                            <label for="q{{ question._id }}_{{ loop.index }}">{{ option }}</label>
+                                   {% if answers and answers['question_' ~ question._id] == (option if option is string else option.value) %}checked{% endif %}>
+                            <label for="q{{ question._id }}_{{ loop.index }}">{{ option if option is string else option.label }}</label>
                         </div>
                         {% endfor %}
                     </div>
@@ -42,6 +42,38 @@
                            placeholder="Type your answer here"
                            required
                            value="{{ answers['question_' ~ question._id] if answers }}">
+                
+                {% elif question.question_type == 'checkbox' %}
+                    <div class="checkbox-group">
+                        {% for option in question.options %}
+                        <div class="checkbox-option">
+                            <input type="checkbox" 
+                                   id="q{{ question._id }}_{{ loop.index }}" 
+                                   name="question_{{ question._id }}" 
+                                   value="{{ option if option is string else option.value }}"
+                                   {% if answers and question._id|string in answers and (option if option is string else option.value) in answers['question_' ~ question._id] %}checked{% endif %}>
+                            <label for="q{{ question._id }}_{{ loop.index }}">{{ option if option is string else option.label }}</label>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% if question.required %}
+                    <input type="hidden" class="checkbox-validator" name="validator_{{ question._id }}" required>
+                    {% endif %}
+                
+                {% elif question.question_type == 'likert_scale' %}
+                    <div class="likert-group">
+                        {% for option in question.options %}
+                        <div class="radio-option">
+                            <input type="radio" 
+                                   id="q{{ question._id }}_{{ loop.index }}" 
+                                   name="question_{{ question._id }}" 
+                                   value="{{ option if option is string else option.value }}"
+                                   required
+                                   {% if answers and answers['question_' ~ question._id] == (option if option is string else option.value) %}checked{% endif %}>
+                            <label for="q{{ question._id }}_{{ loop.index }}">{{ option if option is string else option.label }}</label>
+                        </div>
+                        {% endfor %}
+                    </div>
                     
                 {% elif question.question_type in ['rating', 'single_choice'] %}
                     <select class="select-input" 
@@ -49,9 +81,9 @@
                             required>
                         <option value="">Select an option</option>
                         {% for option in question.options %}
-                        <option value="{{ option }}" 
-                                {% if answers and answers['question_' ~ question._id] == option %}selected{% endif %}>
-                            {{ option }}
+                        <option value="{{ option if option is string else option.value }}" 
+                                {% if answers and answers['question_' ~ question._id] == (option if option is string else option.value) %}selected{% endif %}>
+                            {{ option if option is string else option.label }}
                         </option>
                         {% endfor %}
                     </select>
@@ -107,13 +139,13 @@
     display: block;
 }
 
-.radio-group {
+.radio-group, .checkbox-group, .likert-group {
     display: flex;
     flex-direction: column;
     gap: 10px;
 }
 
-.radio-option {
+.radio-option, .checkbox-option {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -140,5 +172,30 @@
     background-color: #0056b3;
 }
 </style>
+
+<script>
+// This script handles validation for checkbox groups
+document.addEventListener('DOMContentLoaded', function() {
+    const checkboxGroups = document.querySelectorAll('.checkbox-group');
+    
+    checkboxGroups.forEach(group => {
+        const checkboxes = group.querySelectorAll('input[type="checkbox"]');
+        const validator = group.parentElement.querySelector('.checkbox-validator');
+        
+        if (validator) {
+            checkboxes.forEach(checkbox => {
+                checkbox.addEventListener('change', function() {
+                    const anyChecked = Array.from(checkboxes).some(cb => cb.checked);
+                    validator.setCustomValidity(anyChecked ? '' : 'Please select at least one option');
+                });
+            });
+            
+            // Initial validation
+            const anyChecked = Array.from(checkboxes).some(cb => cb.checked);
+            validator.setCustomValidity(anyChecked ? '' : 'Please select at least one option');
+        }
+    });
+});
+</script>
 
 {% endblock %}

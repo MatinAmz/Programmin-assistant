@@ -131,6 +131,11 @@
 </style>
 
 <div class="programming-container">
+    <!-- Timer Section -->
+    <div class="timer-container alert alert-info mb-3">
+        <strong>Time Remaining: <span id="timer">{{ '%02d:%02d'|format(timer_duration|default(30), 0) }}</span></strong>
+    </div>
+    
     <!-- Top Bar Section -->
     <div class="top-bar">
         <h1>{{ question.question_text }}</h1>
@@ -144,9 +149,9 @@
             <form id="codeForm" method="POST" action="{{ url_for('programming_run', page_num=page_num) }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                 <textarea
-                    id="codeEditor"
-                    name="code"
-                    style="display: none;">{{ code if code else 'def solution(a, b):\n    # Write your code here\n    pass' }}</textarea>
+                id="codeEditor"
+                name="code"
+                style="display: none;">{{ question.starter_code if question.starter_code else code }}</textarea>
                 <div class="button-group">
                     <button type="submit" class="run-btn">Run Code</button>
                 </div>
@@ -216,14 +221,15 @@
 <script>
     // Initialize CodeMirror
     var editor = CodeMirror.fromTextArea(document.getElementById("codeEditor"), {
-        mode: "python",
-        theme: "monokai",
-        lineNumbers: true,
-        indentUnit: 4,
-        autoCloseBrackets: true,
-        matchBrackets: true,
-        styleActiveLine: true
-    });
+    mode: "python",
+    theme: "monokai",
+    lineNumbers: true,
+    indentUnit: 4,
+    autoCloseBrackets: true,
+    matchBrackets: true,
+    styleActiveLine: true
+});
+editor.setValue(editor.getValue());
 
     // Update code value before form submissions
     document.getElementById("codeForm").onsubmit = function() {
@@ -239,35 +245,177 @@
     };
 
     // Autosave functionality
-// Autosave functionality
-let saveTimeout;
-function autosaveCode() {
-    const code = editor.getValue();
-    fetch(`/programming/{{ page_num }}/autosave`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-CSRF-TOKEN': '{{ csrf_token() }}'
-        },
-        body: JSON.stringify({ code: code })
-    })
-    .then(response => {
-        console.log('Autosaved at', new Date().toLocaleTimeString());
-    })
-    .catch(error => {
-        console.error('Error during autosave:', error);
+    let saveTimeout;
+    function autosaveCode() {
+        const code = editor.getValue();
+        fetch(`/programming/{{ page_num }}/autosave`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': '{{ csrf_token() }}'
+            },
+            body: JSON.stringify({ code: code })
+        })
+        .then(response => {
+            console.log('Autosaved at', new Date().toLocaleTimeString());
+        })
+        .catch(error => {
+            console.error('Error during autosave:', error);
+        });
+    }
+
+    // Set up auto-save on code changes
+    editor.on('change', () => {
+        if (saveTimeout) clearTimeout(saveTimeout);
+        saveTimeout = setTimeout(autosaveCode, 20000); // 
     });
-}
 
-// Set up auto-save on code changes
-editor.on('change', () => {
-    if (saveTimeout) clearTimeout(saveTimeout);
-    saveTimeout = setTimeout(autosaveCode, 20000); // 
-});
+    // Also save when page is about to unload
+    window.addEventListener('beforeunload', function() {
+        autosaveCode(); // Save one final time before leaving
+    });
+    
 
-// Also save when page is about to unload
-window.addEventListener('beforeunload', function() {
-    autosaveCode(); // Save one final time before leaving
-});
+    document.querySelector('.run-btn').addEventListener('click', function(e) {
+        e.preventDefault(); // Prevent default button behavior
+        
+        // Get the current code from the editor
+        const code = editor.getValue();
+        
+        // Create FormData object
+        const formData = new FormData();
+        formData.append('code', code);
+        formData.append('csrf_token', '{{ csrf_token() }}');
+        
+        // Show loading indicator in test section
+        document.querySelector('.test-section').innerHTML = 
+            '<h3>Test Results</h3><div class="test-results">Running tests...</div>';
+        
+        // Send AJAX request
+        fetch('{{ url_for('programming_run', page_num=page_num) }}', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.text())
+        .then(html => {
+            // Parse the HTML response
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            
+            // Extract just the test results section
+            const testResultsHtml = doc.querySelector('.test-results')?.outerHTML || 
+                                  '<div class="test-results">No results returned</div>';
+            
+            // Update just the test results section
+            document.querySelector('.test-section').innerHTML = 
+                '<h3>Test Results</h3>' + testResultsHtml;
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            document.querySelector('.test-section').innerHTML = 
+                '<h3>Test Results</h3><div class="test-results">Error running code: ' + 
+                error.message + '</div>';
+        });
+    });
+
+    // Timer functionality
+    const timerMinutes = {{ timer_duration|default(20) }};
+    let totalSeconds = timerMinutes * 60;
+    const timerElement = document.getElementById('timer');
+    const submitForm = document.getElementById('submitForm');
+
+    function updateTimer() {
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        
+        // Format as MM:SS
+        timerElement.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        
+        // Change color when less than 5 minutes remain
+        if (totalSeconds <= 300) {
+            timerElement.style.color = 'red';
+            timerElement.parentElement.classList.remove('alert-info');
+            timerElement.parentElement.classList.add('alert-danger');
+        }
+        
+        // Auto-submit when timer reaches zero
+        if (totalSeconds <= 0) {
+            clearInterval(timerInterval);
+            
+            // Update the code input with the latest editor content
+            document.getElementById('submit-code').value = editor.getValue();
+            
+            // Show an alert to inform the user
+            alert('Time is up! Your code is being submitted automatically.');
+            
+            // Submit the form
+            submitForm.submit();
+            return;
+        }
+        
+        totalSeconds--;
+    }
+    
+    // Start the timer when the page loads
+    const timerInterval = setInterval(updateTimer, 1000);
+
+    // Save timer state in localStorage
+    window.addEventListener('beforeunload', function() {
+        localStorage.setItem('timerRemaining', totalSeconds);
+        localStorage.setItem('timerPage', '{{ page_num }}');
+    });
+    
+    // Check if there's a saved timer state
+    const savedTime = localStorage.getItem('timerRemaining');
+    const savedPage = localStorage.getItem('timerPage');
+    const currentPage = '{{ page_num }}';
+    
+    if (savedTime && savedPage === currentPage) {
+        totalSeconds = parseInt(savedTime);
+        updateTimer(); // Update display immediately
+    }
+
+    document.querySelector('.prompt-btn').addEventListener('click', function(e) {
+        e.preventDefault(); // Prevent default form submission
+        
+        // Get the current code from the editor and the prompt
+        const code = editor.getValue();
+        const prompt = document.querySelector('textarea[name="prompt"]').value;
+        
+        if (!prompt.trim()) {
+            alert('Please enter a question or prompt for the AI assistant.');
+            return;
+        }
+        
+        // Create FormData object
+        const formData = new FormData();
+        formData.append('code', code);
+        formData.append('prompt', prompt);
+        formData.append('csrf_token', '{{ csrf_token() }}');
+        
+        // Show loading indicator in AI response area
+        document.querySelector('.ai-response').innerHTML = '<p>Getting help...</p>';
+        
+        // Send AJAX request
+        fetch('{{ url_for('programming_prompt', page_num=page_num) }}', {
+            method: 'POST',
+            body: formData,
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+        })
+        .then(response => response.text())
+        .then(responseText => {
+            // Update the AI response section with the response text
+            document.querySelector('.ai-response').innerHTML = 
+                '<div class="response-content">' + responseText + '</div>';
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            document.querySelector('.ai-response').innerHTML = 
+                '<div class="response-content">Error getting help: ' + error.message + '</div>';
+        });
+    });
 </script>
+
 {% endblock %}

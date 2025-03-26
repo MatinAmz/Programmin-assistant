@@ -7,6 +7,7 @@ from bson.objectid import ObjectId
 from flask_mail import Mail, Message
 import random
 import string
+import math
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired
 import bcrypt
 from functools import wraps
@@ -275,68 +276,193 @@ def presurvey():
 def run_code_with_test_cases(code, test_cases):
     results = []
     
-    # Create a temporary file for the code
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        # Add a main block to handle input based on the existing test cases
-        full_code = code + "\n\nif __name__ == '__main__':\n    try:\n        a = int(input())\n        b = int(input())\n        result = solution(a, b)\n        print(result)\n    except Exception as e:\n        print(f'Error: {str(e)}')"
-        f.write(full_code)
-        temp_file = f.name
+    for i, test_case in enumerate(test_cases):
+        input_data = test_case.get('input', '')
+        expected_output = test_case.get('expected_output', '').strip()
+        code_setup = test_case.get('code_setup', '')
+        test_name = test_case.get('test_name', f'Test Case {i+1}')
+        
+        try:
+            # Create a temporary file for the test
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                # Start with imports that might be needed
+                f.write("import sys\n")
+                f.write("import io\n")
+                f.write("import asyncio\n\n")
+                
+                # Write the student's code first
+                f.write(code + "\n\n")
+                
+                # Apply code_setup if provided
+                if code_setup:
+                    # Handle function replacement cases
+                    if code_setup.startswith('def ') or code_setup.startswith('async def '):
+                        # Extract function name
+                        func_name = code_setup.split('def ')[1].split('(')[0].strip()
+                        
+                        # Add a modified version of the function that will override the original
+                        f.write("# Test function replacement\n")
+                        f.write(f"{code_setup}\n\n")
+                    else:
+                        # Just add the setup code
+                        f.write("# Additional test setup\n")
+                        f.write(f"{code_setup}\n\n")
+                
+                # Add general test runner code
+                f.write("""
+# Test execution wrapper
+if __name__ == '__main__':
+    # Capture output
+    output_capture = io.StringIO()
+    original_stdout = sys.stdout
+    sys.stdout = output_capture
     
     try:
-        for test_case in test_cases:
-            input_data = test_case.get('input', '')
-            expected_output = str(test_case.get('expected_output', '')).strip()
+        # Try different execution methods based on what's available
+        
+        # First check for specific test patterns
+        if 'print_flow' in globals():
+            # Execute print_flow if it exists (special test case)
+            print_flow()
             
+        # Check for normal main function
+        elif 'main' in globals():
+            # Execute main function
+            main()
+            
+        # Look for async functions that might need to be run
+        else:
+            # Find all async functions
+            async_funcs = [name for name, func in globals().items() 
+                          if callable(func) and hasattr(func, '__await__')
+                          and not name.startswith('__')]
+            
+            # If we have async functions, run the first one
+            if async_funcs:
+                asyncio.run(globals()[async_funcs[0]]())
+            else:
+                # Look for any regular function that might be the main test target
+                regular_funcs = [name for name, func in globals().items()
+                                if callable(func) and not name.startswith('__') 
+                                and not hasattr(func, '__await__')]
+                
+                # If there's input data and we have a function, try calling it with the input
+                if regular_funcs and '""" + input_data + """':
+                    # Try to evaluate the input and call the function
+                    try:
+                        input_val = eval('""" + input_data + """')
+                        result = globals()[regular_funcs[0]](input_val)
+                        if result is not None:
+                            print(result)
+                    except:
+                        # If eval fails, just call without args
+                        result = globals()[regular_funcs[0]]()
+                        if result is not None:
+                            print(result)
+                elif regular_funcs:
+                    # Just call the first function without args
+                    result = globals()[regular_funcs[0]]()
+                    if result is not None:
+                        print(result)
+    
+    except Exception as e:
+        # Print exception but continue to capture it
+        print(f"Error: {str(e)}")
+    
+    # Restore stdout and get output
+    sys.stdout = original_stdout
+    print(output_capture.getvalue().strip())
+""")
+                
+                temp_file = f.name
+            
+            # Run the test file as a separate process
             process = subprocess.Popen(
                 ['python3', temp_file],
-                stdin=subprocess.PIPE,
+                stdin=subprocess.PIPE if input_data else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                timeout=5
+                text=True
             )
             
+            # Get the results with timeout protection
             try:
-                output, error = process.communicate(input=input_data, timeout=5)
-                actual_output = output.strip()
+                stdout, stderr = process.communicate(input=input_data if input_data else None, timeout=10)
                 
+                # Process the output for special cases
+                actual_output = stdout.strip()
+                error_msg = stderr.strip()
+                
+                # Determine if the test passed
+                if expected_output.startswith('[') and expected_output.endswith(']'):
+                    # Try to compare as Python objects for lists
+                    try:
+                        expected_list = eval(expected_output)
+                        # Try to evaluate actual output as a list
+                        if actual_output.startswith('[') and actual_output.endswith(']'):
+                            actual_list = eval(actual_output)
+                            status = 'passed' if actual_list == expected_list else 'failed'
+                        else:
+                            status = 'failed'
+                    except:
+                        # Fall back to string comparison
+                        status = 'passed' if actual_output == expected_output else 'failed'
+                else:
+                    # For non-list outputs, normalize and compare
+                    expected_norm = ' '.join(expected_output.split())
+                    actual_norm = ' '.join(actual_output.split())
+                    status = 'passed' if actual_norm == expected_norm else 'failed'
+                
+                # Check for errors
+                if error_msg and "Traceback" in error_msg:
+                    if "RuntimeWarning" not in error_msg:  # Ignore runtime warnings
+                        status = 'error'
+                
+                # Create the result
                 result = {
+                    'test_name': test_name,
                     'input': input_data,
                     'expected': expected_output,
                     'actual': actual_output,
-                    'error': error if error else None
+                    'status': status
                 }
                 
-                # Only include error field if there is an error
-                if not result['error']:
-                    del result['error']
-                
-                if error:
-                    result['status'] = 'error'
-                elif actual_output == expected_output:
-                    result['status'] = 'passed'
-                else:
-                    result['status'] = 'failed'
+                if error_msg and "RuntimeWarning" not in error_msg:
+                    result['error'] = error_msg
                 
                 results.append(result)
                 
             except subprocess.TimeoutExpired:
                 process.kill()
                 results.append({
+                    'test_name': test_name,
                     'status': 'error',
-                    'error': 'Code execution timed out',
+                    'error': 'Code execution timed out (10 seconds)',
                     'input': input_data
                 })
                 
-    except Exception as e:
-        results.append({
-            'status': 'error',
-            'error': f'Execution error: {str(e)}'
-        })
+            # Clean up
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+                
+        except Exception as e:
+            import traceback
+            results.append({
+                'test_name': test_name,
+                'status': 'error',
+                'error': f'Test runner error: {str(e)}',
+                'traceback': traceback.format_exc()
+            })
     
-    finally:
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
+    # Ensure we return something even if all tests fail to run
+    if not results:
+        results.append({
+            'test_name': 'System Error',
+            'status': 'error',
+            'error': 'No test results were generated. The test system may be misconfigured.',
+            'actual': '',
+            'expected': ''
+        })
     
     return results
 
@@ -365,19 +491,26 @@ def autosave_code(page_num):
         print(f"Autosave error: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
     
-
 @app.route('/programming/<page_num>')
 @login_required
 def programming_question(page_num):
     try:
-
-        track_activity_start(current_user.id, f'programming_q{page_num}')
+        # Format the question_id consistently
+        question_id = f'programming_q{page_num}'
+        
+        # Track activity start with try/except to ensure it doesn't break the page
+        try:
+            track_activity_start(current_user.id, question_id)
+        except Exception as tracking_error:
+            print(f"Error tracking activity start: {tracking_error}")
+            # Continue with the page even if tracking fails
+        
         # Get the question from MongoDB using question_id format
-        question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
         print(f"Found question: {question}")  # Debug print
         
         if not question:
-            print(f"No question found for programming_q{page_num}")
+            print(f"No question found for {question_id}")
             flash('Programming question not found.', 'error')
             return render_template('programming/programming.html',
                             question={'question_text': 'Question not found'},
@@ -387,32 +520,38 @@ def programming_question(page_num):
         # First try to get autosaved code
         autosaved = mongo.db.code_autosaves.find_one({
             'user_id': current_user.id,
-            'question_id': f'programming_q{page_num}'
-        })
+            'question_id': question_id
+        }, sort=[('saved_at', -1)])  # Get the most recent autosave
         
         # If no autosave exists, try to get submitted code
         if not autosaved:
             submitted = mongo.db.submissions.find_one({
                 'user_id': current_user.id,
-                'question_id': f'programming_q{page_num}'
+                'question_id': question_id
             })
-            code = submitted.get('code') if submitted else ''
+            # If there's submitted code, use it; otherwise, use starter_code from question
+            if submitted and submitted.get('code'):
+                code = submitted.get('code')
+            else:
+                # Use the starter code from the question document
+                code = question.get('starter_code', '')
         else:
             code = autosaved.get('code')
         
-        # Add test cases if they don't exist
-        if 'test_cases' not in question:
-            question['test_cases'] = [
-                {'input': 'babad', 'expected_output': 'bab'},
-                {'input': 'cbbd', 'expected_output': 'bb'},
-                {'input': 'a', 'expected_output': 'a'},
-                {'input': 'ac', 'expected_output': 'a'}
-            ]
+        # Add timer duration to the template context (in minutes)
+        # You can customize timer duration per question
+        if page_num == '1':
+            timer_duration = 20  # 20 minutes for question 1
+        elif page_num == '2':
+            timer_duration = 30  # 30 minutes for question 2
+        else:
+            timer_duration = 30  # Default is 30 minutes
         
         return render_template('programming/programming.html',
                           question=question,
                           code=code,
-                          page_num=page_num)
+                          page_num=page_num,
+                          timer_duration=timer_duration)  # Pass timer duration to template
                           
     except Exception as e:
         print(f"Error in programming_question: {str(e)}")
@@ -422,8 +561,7 @@ def programming_question(page_num):
                           question={'question_text': 'Error loading question'},
                           code='',
                           page_num=page_num)
-
-
+    
 # Load environment variables
 load_dotenv()
 
@@ -436,7 +574,6 @@ client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 def programming_prompt(page_num):
     prompt = request.form.get('prompt')
     code = request.form.get('code', '')
-    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
     
     try:
         # Send prompt directly to ChatGPT
@@ -460,6 +597,12 @@ def programming_prompt(page_num):
     except Exception as e:
         ai_response = f"Error: {str(e)}"
     
+    # For AJAX requests, return just the plain text response
+    if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+        return ai_response
+    
+    # For traditional form submissions, return the full page
+    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
     return render_template('programming/programming.html',
                          question=question,
                          code=code,
@@ -476,97 +619,20 @@ def programming_run(page_num):
     
     # Get test cases from the question
     test_cases = question.get('test_cases', [])
-    test_results = []
     
-    # Create a temporary file to run the code
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        # Determine the right wrapper code based on question type
-        if page_num == '1':  # Addition question
-            full_code = code + """
-if __name__ == '__main__':
-    try:
-        a = int(input())
-        b = int(input())
-        result = solution(a, b)
-        print(result)
-    except Exception as e:
-        print(f'Error: {str(e)}')
-"""
-        else:  # Palindrome question
-            full_code = code + """
-if __name__ == '__main__':
-    try:
-        s = input().strip()
-        result = solution(s)
-        print(result)
-    except Exception as e:
-        print(f'Error: {str(e)}')
-"""
-        f.write(full_code)
-        temp_file = f.name
+    # Use the improved test case runner
+    test_results = run_code_with_test_cases(code, test_cases)
     
-    try:
-        for test_case in test_cases:
-            # Prepare the test input
-            input_data = test_case.get('input', '')
-            expected_output = str(test_case.get('expected_output', '')).strip()
-            
-            # Run the code with the test input
-            process = subprocess.Popen(
-                ['python3', temp_file],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            
-            try:
-                output, error = process.communicate(input=input_data, timeout=5)
-                
-                if error:
-                    test_results.append({
-                        'status': 'error',
-                        'input': input_data,
-                        'error': error
-                    })
-                else:
-                    actual_output = output.strip()
-                    test_results.append({
-                        'input': input_data,
-                        'expected': expected_output,
-                        'actual': actual_output,
-                        'status': 'passed' if actual_output == expected_output else 'failed'
-                    })
-            
-            except subprocess.TimeoutExpired:
-                process.kill()
-                test_results.append({
-                    'status': 'error',
-                    'error': 'Code execution timed out',
-                    'input': input_data
-                })
-    
-    except Exception as e:
-        test_results.append({
-            'status': 'error', 
-            'error': str(e)
-        })
-    
-    finally:
-        if os.path.exists(temp_file):
-            os.unlink(temp_file)
-    
-    # Save submission
-    mongo.db.submissions.insert_one({
+    # Log the run attempt
+    mongo.db.run_attempts.insert_one({
         'user_id': current_user.id,
         'question_id': f'programming_q{page_num}',
         'code': code,
         'test_results': test_results,
-        'submitted_at': datetime.datetime.utcnow()
+        'timestamp': datetime.datetime.utcnow()
     })
     
-    # Return to the same page with test results instead of redirect
-    # This way the user can see their test results
+    # Return to the same page with test results
     return render_template('programming/programming.html',
                          question=question,
                          code=code,
@@ -652,46 +718,88 @@ def feedback(question_id):
         else:
             usage_percentage = random.randint(40, 90)
         
-        # Create time-based data for the 1-hour session (real data)
-        # We'll use 5-minute intervals (12 intervals in an hour)
-        time_intervals = ['0:00', '5:00', '10:00', '15:00', '20:00', '25:00', 
-                         '30:00', '35:00', '40:00', '45:00', '50:00', '55:00']
-        
-        # Get real interaction data
-        interactions = list(mongo.db.ai_interactions.find({
+        # Get the start and end time for this question using user activities
+        activity_record = mongo.db.user_activities.find_one({
             'user_id': current_user.id,
-            'question_id': question_id
-        }).sort('timestamp', 1))
+            'activity': question_id,
+            'end_time': {'$ne': None}  # Make sure the activity has ended
+        }, sort=[('end_time', -1)])  # Get the most recent completed activity
         
-        # Initialize counts for each interval
-        interval_counts = [0] * len(time_intervals)
-        
-        # Process interactions into intervals
-        if interactions:
-            try:
-                submission = mongo.db.submissions.find_one({
+        if activity_record and activity_record.get('start_time') and activity_record.get('end_time'):
+            start_time = activity_record['start_time']
+            end_time = activity_record['end_time']
+            print(f"Using activity tracking: start={start_time}, end={end_time}")
+        else:
+            # Fallback - check the submission timestamp
+            submission = mongo.db.submissions.find_one({
+                'user_id': current_user.id,
+                'question_id': question_id
+            })
+            
+            if submission and submission.get('timestamp'):
+                end_time = submission['timestamp']
+                # Estimate start time based on question
+                if question_id == 'programming_q1':
+                    duration = 20  # minutes
+                else:
+                    duration = 30  # minutes
+                start_time = end_time - datetime.timedelta(minutes=duration)
+                print(f"Using submission time with estimated duration: start={start_time}, end={end_time}")
+            else:
+                # Last resort - use AI interactions if any
+                interactions = list(mongo.db.ai_interactions.find({
                     'user_id': current_user.id,
                     'question_id': question_id
-                })
+                }).sort('timestamp', 1))
                 
-                if submission:
-                    end_time = submission['timestamp']
-                    start_time = end_time - datetime.timedelta(hours=1)
-                else:
+                if interactions and len(interactions) > 0:
                     start_time = interactions[0]['timestamp']
-                    end_time = start_time + datetime.timedelta(hours=1)
-                
-                for interaction in interactions:
-                    timestamp = interaction['timestamp']
-                    if timestamp < start_time or timestamp > end_time:
-                        continue
-                        
-                    minutes_from_start = (timestamp - start_time).total_seconds() / 60
-                    interval_index = min(int(minutes_from_start / 5), 11)
-                    interval_counts[interval_index] += 1
-                    
-            except Exception as e:
-                print(f"Error processing interaction times: {e}")
+                    end_time = interactions[-1]['timestamp']
+                    # Ensure we have at least a 10-minute window
+                    if (end_time - start_time).total_seconds() < 600:
+                        end_time = start_time + datetime.timedelta(minutes=10)
+                    print(f"Using interaction times: start={start_time}, end={end_time}")
+                else:
+                    # Final fallback - just use current time with default duration
+                    end_time = datetime.datetime.utcnow()
+                    start_time = end_time - datetime.timedelta(minutes=20)
+                    print(f"Using default times: start={start_time}, end={end_time}")
+        
+        # Force a minimum duration based on the question
+        min_duration = 20 if question_id == 'programming_q1' else 30  # minutes
+        
+        # Calculate total duration in minutes (rounded up to nearest 2 minutes)
+        total_duration = max(min_duration, (end_time - start_time).total_seconds() / 60)
+        total_duration_rounded = math.ceil(total_duration / 2) * 2  # Round up to nearest 2
+        
+        print(f"Total duration: {total_duration} minutes, rounded to {total_duration_rounded} minutes")
+        
+        # Create 2-minute intervals
+        time_intervals = []
+        interval_counts = []
+        
+        # Start from 2 minutes and go up to the total duration, stepping by 2
+        for minute in range(2, int(total_duration_rounded) + 1, 2):
+            time_intervals.append(str(minute))
+            
+            # Count interactions in this 2-minute interval
+            interval_start = start_time + datetime.timedelta(minutes=minute-2)
+            interval_end = start_time + datetime.timedelta(minutes=minute)
+            
+            count = mongo.db.ai_interactions.count_documents({
+                'user_id': current_user.id,
+                'question_id': question_id,
+                'timestamp': {
+                    '$gte': interval_start,
+                    '$lt': interval_end
+                }
+            })
+            
+            interval_counts.append(count)
+        
+        # Debug print the intervals and counts
+        print(f"Time intervals: {time_intervals}")
+        print(f"Interval counts: {interval_counts}")
         
         # Prepare time data for template
         time_data = {
@@ -699,10 +807,14 @@ def feedback(question_id):
             'values': interval_counts
         }
         
-        # Set the next page to programming question 2
-        # Since we're only showing feedback for question 1
-        next_url = url_for('programming_question', page_num=2)
-        next_page_num = '2'
+        # Set the next page to programming question 2 or post-survey
+        page_num = question_id.replace('programming_q', '')
+        if page_num == '1':
+            next_page_num = '2'
+            next_url = url_for('programming_question', page_num=next_page_num)
+        else:
+            next_page_num = 'survey'
+            next_url = url_for('postsurvey')
         
         # Save feedback data to MongoDB for this user
         feedback_data = {
@@ -711,7 +823,10 @@ def feedback(question_id):
             'timestamp': datetime.datetime.now(datetime.UTC),
             'personal_usage_count': personal_usage_count,
             'usage_percentage': usage_percentage,
-            'time_data': time_data
+            'time_data': time_data,
+            'session_start': start_time,
+            'session_end': end_time,
+            'session_duration_minutes': total_duration
         }
         
         # Save to MongoDB using upsert
@@ -724,7 +839,7 @@ def feedback(question_id):
             upsert=True
         )
 
-        # Include next_url in the template context so it can be used in buttons
+        # Include next_url in the template context
         return render_template('feedback/feedback.html',
             question_id=question_id,
             personal_usage_count=personal_usage_count,
@@ -736,6 +851,7 @@ def feedback(question_id):
 
     except Exception as e:
         print(f"Error in feedback route: {str(e)}")
+        traceback.print_exc()
         flash('Error loading feedback data', 'error')
         return render_template('feedback/feedback.html', question_id=question_id)
 

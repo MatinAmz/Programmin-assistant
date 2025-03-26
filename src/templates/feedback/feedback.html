@@ -59,13 +59,6 @@
                     </svg>
                 </div>
                 <p class="mt-4 text-gray-700">
-                    {% if usage_percentage|default(0) < 80 %}
-                        You used AI less than most students on this question.
-                    {% elif usage_percentage|default(0) > 120 %}
-                        You used AI more frequently than most students.
-                    {% else %}
-                        Your AI usage is similar to other students.
-                    {% endif %}
                 </p>
             </div>
         </div>
@@ -73,15 +66,19 @@
 
     <!-- Usage Over Time Chart -->
     <div class="bg-white p-6 rounded-lg shadow mb-6">
-        <h2 class="text-xl font-semibold mb-4">Your AI Usage During the Session</h2>
+        <h2 class="text-xl font-semibold mb-4">Your AI Usage During This Question</h2>
         <canvas id="usageChart" height="100"></canvas>
     </div>
 
     <!-- Navigation Buttons -->
     <div class="mt-8 text-center">
-        <a href="{{ url_for('programming_question', page_num=next_page_num) }}" 
+        <a href="{{ next_url }}" 
            class="bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow">
-            Continue to Next Question
+            {% if next_page_num == 'survey' %}
+                Continue to Post-Survey
+            {% else %}
+                Continue to Next Question
+            {% endif %}
         </a>
     </div>
 </div>
@@ -90,12 +87,19 @@
 // Parse the data passed from Flask with fallbacks
 const timeData = {{ time_data|default({'labels':[], 'values':[]})|tojson }};
 
+// Format labels to always show minutes clearly
+const formattedLabels = timeData.labels.map(label => {
+    // Extract just the minutes from the time format (e.g., "15:00" -> "15")
+    const minutes = parseInt(label.split(':')[0]);
+    return `${minutes} min`;
+});
+
 // Usage Pattern Chart
 const usageCtx = document.getElementById('usageChart').getContext('2d');
 new Chart(usageCtx, {
     type: 'line',
     data: {
-        labels: timeData.labels,
+        labels: formattedLabels,
         datasets: [{
             label: 'Number of AI Interactions',
             data: timeData.values,
@@ -113,14 +117,14 @@ new Chart(usageCtx, {
             },
             title: {
                 display: true,
-                text: 'AI Usage During Session (5-minute intervals)'
+                text: 'AI Usage During Question (minutes)'
             }
         },
         scales: {
             x: {
                 title: {
                     display: true,
-                    text: 'Minutes into session'
+                    text: 'Minutes into question'
                 }
             },
             y: {

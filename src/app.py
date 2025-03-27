@@ -1183,26 +1183,26 @@ def api_programming_question(page_num):
 
 
 # feedback endpoint updated for JWT
-@api_bp.route('/feedback', methods=['GET'])
-@jwt_required()
-def api_feedback():
-    try:
-        user_id = get_jwt_identity()
-        feedback_data = mongo.db.feedback.find_one({'user_id': user_id})
+# @api_bp.route('/feedback', methods=['GET'])
+# @jwt_required()
+# def api_feedback():
+#     try:
+#         user_id = get_jwt_identity()
+#         feedback_data = mongo.db.feedback.find_one({'user_id': user_id})
         
-        if not feedback_data:
-            return jsonify({'status': 'error', 'message': 'Feedback data not found'}), 404
+#         if not feedback_data:
+#             return jsonify({'status': 'error', 'message': 'Feedback data not found'}), 404
             
-        # Convert ObjectId fields and datetime fields to strings
-        feedback_data['_id'] = str(feedback_data['_id'])
-        feedback_data['timestamp'] = feedback_data['timestamp'].isoformat()
+#         # Convert ObjectId fields and datetime fields to strings
+#         feedback_data['_id'] = str(feedback_data['_id'])
+#         feedback_data['timestamp'] = feedback_data['timestamp'].isoformat()
         
-        return jsonify({
-            'status': 'success',
-            'feedback': feedback_data
-        }), 200
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+#         return jsonify({
+#             'status': 'success',
+#             'feedback': feedback_data
+#         }), 200
+#     except Exception as e:
+#         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 # New routes

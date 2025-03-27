@@ -21,14 +21,15 @@ import datetime
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-from flask_wtf.csrf import CSRFProtect, generate_csrf,validate_csrf
+from flask_wtf.csrf import CSRFProtect
 from flask_cors import CORS
-
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import JWTManager
 
 
 app = Flask(__name__)
 
-CORS(app,supports_credentials=True, resources={r"/api/*": {"origins": "http://localhost:8080"}})  # Allow Vue.js frontend (assuming it's running on localhost:8080)
+CORS(app,resources={r"/api/*": {"origins": ["http://localhost:8080","https://understand-ai.org/","https://understand-ai.org/uh/"],"supports_credentials": True}})
 
 
 app.config['MONGO_DBNAME'] = 'webapp'
@@ -44,7 +45,12 @@ app.config['MAIL_USE_SSL'] = True
 csrf = CSRFProtect(app) 
 
 api_bp = Blueprint('api', __name__)
+jwt = JWTManager(app)
+
 csrf.exempt(api_bp)
+CORS(api_bp,resources={r"/api/*": {"origins": "http://localhost:8080","supports_credentials": True}})
+
+
 
 mail = Mail(app)
 # Setup for token generation for password reset
@@ -928,12 +934,82 @@ def completion_page():
 
 
 
-@api_bp.route('/get-csrf-token', methods=['GET'])
-def get_csrf():
-    csrf_token = generate_csrf()  # Generate the CSRF token
-    response = make_response(jsonify({"csrf_token": csrf_token}))
-    response.set_cookie('csrf_token', csrf_token, httponly=False, samesite='Lax')
-    return response
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    return jsonify({
+        'status': 'error',
+        'message': 'Token has expired'
+    }), 401
+
+@jwt.invalid_token_loader
+def invalid_token_callback(error):
+    return jsonify({
+        'status': 'error',
+        'message': 'Invalid token'
+    }), 401
+
+@jwt.unauthorized_loader
+def unauthorized_callback(error):
+    return jsonify({
+        'status': 'error',
+        'message': 'Missing authorization token'
+    }), 401
+
+# Add this route to your blueprint
+@api_bp.route('/check-token', methods=['GET'])
+@jwt_required()
+def check_token():
+    # If we get here, the token is valid
+    # Optional: Add user details if needed
+    current_user_id = get_jwt_identity()
+    return jsonify({
+        'status': 'success',
+        'message': 'Token is valid',
+        'user_id': current_user_id
+    }), 200
+
+
+# Separate endpoint for Microsoft login via POST from Vue
+@api_bp.route('/microsoft_login', methods=['POST'])
+def microsoft_login():
+    data = request.get_json()
+    if not data:
+         return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
+
+    email = data.get('email').lower()
+    name = data.get('name')
+    if not email or not name:
+         return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
+
+    # Check if user exists in the database.
+    existing_user = mongo.db.users.find_one({'email': email})
+    if existing_user:
+         user_id = str(existing_user['_id'])
+    else:
+         # Create a new user with a random password.
+         import uuid
+         random_password = str(uuid.uuid4())
+         hashed_password = bcrypt.hashpw(random_password.encode('utf-8'), bcrypt.gensalt())
+         new_user = {
+             'name': name,
+             'email': email,
+             'password': hashed_password.decode('utf-8')
+         }
+         result = mongo.db.users.insert_one(new_user)
+         user_id = str(result.inserted_id)
+
+    # Create your JWT token.
+    access_token = create_access_token(identity=user_id, expires_delta=datetime.timedelta(hours=1))
+    return jsonify({
+         'status': 'success',
+         'message': 'Microsoft login successful!',
+         'access_token': access_token,
+         'user': {
+             'id': user_id,
+             'name': name,
+             'email': email
+         }
+    })
 
 @api_bp.route('/register', methods=['POST'])
 def api_register():
@@ -976,6 +1052,7 @@ def api_login():
     data = request.get_json()
     if not data:
         return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
+
     email = data.get('email')
     password = data.get('password')
     if not email or not password:
@@ -983,19 +1060,564 @@ def api_login():
 
     user = mongo.db.users.find_one({'email': email})
     if user and bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
-        user_obj = User(user)
-        login_user(user_obj)
+        # Create a token with an expiration time (optional)
+        access_token = create_access_token(identity=str(user['_id']),
+                                           expires_delta=datetime.timedelta(days=1))
         return jsonify({
             'status': 'success',
             'message': 'Login successful!',
+            'access_token': access_token,
             'user': {
-                'id': user_obj.id,
-                'name': user_obj.name,
-                'email': user['email']
+                'id': str(user['_id']),
+                'name': user.get('name'),
+                'email': user.get('email')
             }
         })
     else:
         return jsonify({'status': 'error', 'message': 'Invalid email or password'}), 401
+    
+
+@api_bp.route('/forgot-password', methods=['POST'])
+def api_forgot_password():
+    data = request.get_json()
+    if not data:
+        return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
+    
+    email = data.get('email')
+    if not email:
+        return jsonify({'status': 'error', 'message': 'Email is required'}), 400
+    
+    user = mongo.db.users.find_one({'email': email})
+    if not user:
+        return jsonify({'status': 'error', 'message': 'Email not found'}), 404
+    
+    # Generate a new password
+    new_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+    hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
+    # Update user's password
+    mongo.db.users.update_one(
+        {'email': email},
+        {'$set': {'password': hashed_password}}
+    )
+    
+    # Send email with new password
+    msg = Message("Your New Password", 
+                  sender=app.config['MAIL_USERNAME'], 
+                  recipients=[email])
+    msg.body = f"Your new password is: {new_password}"
+    mail.send(msg)
+    
+    return jsonify({'status': 'success', 'message': 'New password sent to your email'})
+
+    
+@api_bp.route('/presurvey', methods=['GET', 'POST'])
+@jwt_required()
+def api_presurvey():
+    current_user_id = get_jwt_identity()  # This retrieves the user identity stored in the token    
+    if request.method == 'GET':
+        track_activity_start(current_user_id, 'presurvey')
+        questions = list(mongo.db.preSurveyQuestion.find({}, {'_id': 0}))
+        return jsonify({'questions': questions})
+    
+    elif request.method == 'POST':
+        data = request.get_json()
+        if not data or 'answers' not in data:
+            return jsonify({'status': 'error', 'message': 'Invalid data format'}), 400
+        
+        submission = {
+            'user_id': current_user_id,
+            'answers': data['answers'],
+            'submitted_at': datetime.datetime.now(datetime.UTC)
+        }
+        
+        mongo.db.preSurveyAnswers.insert_one(submission)
+        track_activity_end(current_user_id, 'presurvey')
+        
+        return jsonify({'status': 'success', 'message': 'Survey submitted successfully'})
+
+# autosave code endpoint updated for JWT
+@api_bp.route('/autosave/<page_num>', methods=['POST'])
+@jwt_required()
+def api_autosave_code(page_num):
+    data = request.get_json()
+    code = data.get('code', '')
+    try:
+        user_id = get_jwt_identity()
+        current_time = datetime.datetime.utcnow()
+        autosave_doc = {
+            'user_id': user_id,
+            'question_id': f'programming_q{page_num}',
+            'code': code,
+            'saved_at': current_time
+        }
+        mongo.db.code_autosaves.insert_one(autosave_doc)
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# programming question endpoint updated for JWT
+@api_bp.route('/question/<page_num>', methods=['GET'])
+@jwt_required()
+def api_programming_question(page_num):
+    try:
+        question = mongo.db.programmingQuestions.find_one(
+            {'question_id': f'programming_q{page_num}'},
+            {'_id': 0, 'question_id': 1, 'question_text': 1, 'test_cases': 1}
+        )
+        if not question:
+            return jsonify({'status': 'error', 'message': 'Question not found'}), 404
+        
+        # Convert ObjectId fields in test cases if they exist
+        if 'test_cases' in question:
+            for tc in question['test_cases']:
+                if '_id' in tc:
+                    tc['_id'] = str(tc['_id'])
+                    
+        return jsonify({
+            'status': 'success',
+            'question': question
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# feedback endpoint updated for JWT
+@api_bp.route('/feedback', methods=['GET'])
+@jwt_required()
+def api_feedback():
+    try:
+        user_id = get_jwt_identity()
+        feedback_data = mongo.db.feedback.find_one({'user_id': user_id})
+        
+        if not feedback_data:
+            return jsonify({'status': 'error', 'message': 'Feedback data not found'}), 404
+            
+        # Convert ObjectId fields and datetime fields to strings
+        feedback_data['_id'] = str(feedback_data['_id'])
+        feedback_data['timestamp'] = feedback_data['timestamp'].isoformat()
+        
+        return jsonify({
+            'status': 'success',
+            'feedback': feedback_data
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# New routes
+@api_bp.route('/programming/<page_num>/autosave', methods=['POST'])
+@jwt_required()
+def autosave_code(page_num):
+    try:
+        code = request.json.get('code')
+        current_time = datetime.datetime.utcnow()
+        current_user_id = get_jwt_identity()
+        
+        autosave_doc = {
+            'user_id': current_user_id,
+            'question_id': f'programming_q{page_num}',
+            'code': code,
+            'saved_at': current_time
+        }
+        
+        mongo.db.code_autosaves.insert_one(autosave_doc)
+        
+        return jsonify({'status': 'success', 'message': 'Code auto-saved'})
+    except Exception as e:
+        print(f"Autosave error: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api_bp.route('/programming/<page_num>', methods=['GET'])
+@jwt_required()
+def programming_question(page_num):
+    try:
+        current_user_id = get_jwt_identity()
+        question_id = f'programming_q{page_num}'
+        
+        # Track activity start (errors are caught and logged)
+        try:
+            track_activity_start(current_user_id, question_id)
+        except Exception as tracking_error:
+            print(f"Error tracking activity start: {tracking_error}")
+        
+        # Retrieve the question from MongoDB
+        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
+        if not question:
+            return jsonify({'status': 'error', 'message': 'Programming question not found.'}), 404
+        
+        # Check for autosaved code first, then submitted code, then fallback to starter code
+        autosaved = mongo.db.code_autosaves.find_one({
+            'user_id': current_user_id,
+            'question_id': question_id
+        }, sort=[('saved_at', -1)])
+        
+        if not autosaved:
+            submitted = mongo.db.submissions.find_one({
+                'user_id': current_user_id,
+                'question_id': question_id
+            })
+            if submitted and submitted.get('code'):
+                code = submitted.get('code')
+            else:
+                code = question.get('starter_code', '')
+        else:
+            code = autosaved.get('code')
+        
+        # Set timer duration based on page number
+        if page_num == '1':
+            timer_duration = 20  # 20 minutes for question 1
+        elif page_num == '2':
+            timer_duration = 30  # 30 minutes for question 2
+        else:
+            timer_duration = 30  # Default is 30 minutes
+        
+        return jsonify({
+            'status': 'success',
+            'question': question,
+            'code': code,
+            'page_num': page_num,
+            'timer_duration': timer_duration
+        })
+    except Exception as e:
+        print(f"Error in programming_question: {str(e)}")
+        return jsonify({'status': 'error', 'message': 'Error loading programming question'}), 500
+
+
+# Modified programming prompt route
+@api_bp.route('/programming/<page_num>/prompt', methods=['POST'])
+@jwt_required()
+def programming_prompt(page_num):
+    current_user_id = get_jwt_identity()
+    data = request.get_json()  # Expecting JSON body with keys 'prompt' and optionally 'code'
+    prompt = data.get('prompt')
+    code = data.get('code', '')
+
+    if not prompt:
+        return jsonify({'status': 'error', 'message': 'Prompt is required'}), 400
+
+    try:
+        # Send prompt to ChatGPT (example using your client)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        ai_response = response.choices[0].message.content
+
+        # Log the interaction
+        mongo.db.ai_interactions.insert_one({
+            'user_id': current_user_id,
+            'question_id': f'programming_q{page_num}',
+            'prompt': prompt,
+            'ai_response': ai_response,
+            'timestamp': datetime.datetime.utcnow()
+        })
+
+    except Exception as e:
+        ai_response = f"Error: {str(e)}"
+
+    return jsonify({
+        'question_id': f'programming_q{page_num}',
+        'prompt': prompt,
+        'code': code,
+        'ai_response': ai_response
+    })
+
+
+
+# Modified programming run route
+@api_bp.route('/programming/<page_num>/run', methods=['POST'])
+@jwt_required()
+def programming_run(page_num):
+    current_user_id = get_jwt_identity()
+    data = request.get_json()  # Expecting JSON body with key 'code'
+    code = data.get('code')
+
+    if not code:
+        return jsonify({'status': 'error', 'message': 'Code is required'}), 400
+
+    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+    if not question:
+        return jsonify({'status': 'error', 'message': 'Question not found'}), 404
+
+    # Get test cases from the question and run the tests
+    test_cases = question.get('test_cases', [])
+    test_results = run_code_with_test_cases(code, test_cases)
+
+    # Log the run attempt
+    mongo.db.run_attempts.insert_one({
+        'user_id': current_user_id,
+        'question_id': f'programming_q{page_num}',
+        'code': code,
+        'test_results': test_results,
+        'timestamp': datetime.datetime.utcnow()
+    })
+
+    return jsonify({
+        'question': question,
+        'code': code,
+        'page_num': page_num,
+        'test_results': test_results
+    })
+
+
+
+# Modified programming submit route
+@api_bp.route('/programming/<page_num>/submit', methods=['POST'])
+@jwt_required()
+def programming_submit(page_num):
+    current_user_id = get_jwt_identity()
+    data = request.get_json()  # Expecting JSON body with key 'code'
+    code = data.get('code')
+
+    if not code:
+        return jsonify({'status': 'error', 'message': 'No code provided'}), 400
+
+    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+    if not question:
+        return jsonify({'status': 'error', 'message': 'Question not found'}), 404
+
+    # Run tests and calculate score
+    test_cases = question.get('test_cases', [])
+    test_results = run_code_with_test_cases(code, test_cases)
+    total_tests = len(test_results)
+    passed_tests = sum(1 for result in test_results if result.get('status') == 'passed')
+    score = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
+
+    submission = {
+        'user_id': current_user_id,
+        'question_id': f'programming_q{page_num}',
+        'code': code,
+        'test_results': test_results,
+        'score': score,
+        'timestamp': datetime.datetime.now(datetime.UTC)
+    }
+
+    # Save submission using upsert
+    mongo.db.submissions.update_one(
+        {
+            'user_id': current_user_id,
+            'question_id': f'programming_q{page_num}'
+        },
+        {'$set': submission},
+        upsert=True
+    )
+
+    track_activity_end(current_user_id, f'programming_q{page_num}')
+
+    # Instead of redirects, return a JSON response
+    if page_num == '2':
+        return jsonify({'status': 'success', 'message': 'Submission saved. Please proceed to postsurvey.'})
+    else:
+        return jsonify({'status': 'success', 'message': 'Submission saved. Feedback is available.'})
+
+
+
+@api_bp.route('/feedback/<question_id>', methods=['GET'])
+@jwt_required()
+def api_feedback(question_id):
+    try:
+        user_id = get_jwt_identity()  # Get the user ID from the JWT
+        
+        # Count AI interactions for this user and question
+        personal_usage_count = mongo.db.ai_interactions.count_documents({
+            'user_id': user_id,
+            'question_id': question_id
+        })
+        
+        # Determine usage percentage
+        usage_percentage = 0 if personal_usage_count == 0 else random.randint(40, 90)
+        
+        # Get the most recent activity record for this question
+        activity_record = mongo.db.user_activities.find_one({
+            'user_id': user_id,
+            'activity': question_id,
+            'end_time': {'$ne': None}
+        }, sort=[('end_time', -1)])
+        
+        if activity_record and activity_record.get('start_time') and activity_record.get('end_time'):
+            start_time = activity_record['start_time']
+            end_time = activity_record['end_time']
+        else:
+            # Fallback: check submission timestamp
+            submission = mongo.db.submissions.find_one({
+                'user_id': user_id,
+                'question_id': question_id
+            })
+            
+            if submission and submission.get('timestamp'):
+                end_time = submission['timestamp']
+                duration = 20 if question_id == 'programming_q1' else 30
+                start_time = end_time - datetime.timedelta(minutes=duration)
+            else:
+                # Final fallback: use AI interactions or default times
+                interactions = list(mongo.db.ai_interactions.find({
+                    'user_id': user_id,
+                    'question_id': question_id
+                }).sort('timestamp', 1))
+                
+                if interactions:
+                    start_time = interactions[0]['timestamp']
+                    end_time = interactions[-1]['timestamp']
+                    if (end_time - start_time).total_seconds() < 600:
+                        end_time = start_time + datetime.timedelta(minutes=10)
+                else:
+                    end_time = datetime.datetime.utcnow()
+                    start_time = end_time - datetime.timedelta(minutes=20)
+        
+        # Ensure a minimum session duration
+        min_duration = 20 if question_id == 'programming_q1' else 30
+        total_duration = max(min_duration, (end_time - start_time).total_seconds() / 60)
+        total_duration_rounded = math.ceil(total_duration / 2) * 2  # Rounded up to nearest 2 minutes
+        
+        # Create 2-minute intervals and count interactions for each
+        time_intervals = []
+        interval_counts = []
+        for minute in range(2, int(total_duration_rounded) + 1, 2):
+            time_intervals.append(str(minute))
+            interval_start = start_time + datetime.timedelta(minutes=minute-2)
+            interval_end = start_time + datetime.timedelta(minutes=minute)
+            count = mongo.db.ai_interactions.count_documents({
+                'user_id': user_id,
+                'question_id': question_id,
+                'timestamp': {
+                    '$gte': interval_start,
+                    '$lt': interval_end
+                }
+            })
+            interval_counts.append(count)
+        
+        time_data = {
+            'labels': time_intervals,
+            'values': interval_counts
+        }
+        
+        # Determine next step based on question_id
+        page_num = question_id.replace('programming_q', '')
+        if page_num == '1':
+            next_page_num = '2'
+            next_url = url_for('programming_question', page_num=next_page_num)
+        else:
+            next_page_num = 'survey'
+            next_url = url_for('api_postsurvey')
+        
+        # Prepare feedback data
+        feedback_data = {
+            'user_id': user_id,
+            'question_id': question_id,
+            'timestamp': datetime.datetime.now(datetime.UTC),
+            'personal_usage_count': personal_usage_count,
+            'usage_percentage': usage_percentage,
+            'time_data': time_data,
+            'session_start': start_time,
+            'session_end': end_time,
+            'session_duration_minutes': total_duration
+        }
+        
+        # Save feedback data with upsert
+        mongo.db.feedback.update_one(
+            {'user_id': user_id, 'question_id': question_id},
+            {'$set': feedback_data},
+            upsert=True
+        )
+        
+        # Return feedback information as JSON
+        return jsonify({
+            'status': 'success',
+            'feedback': feedback_data,
+            'next': {
+                'page_num': next_page_num,
+                'url': next_url
+            }
+        })
+    
+    except Exception as e:
+        print(f"Error in feedback route: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': 'Error loading feedback data'}), 500
+
+# ------------------------------
+# API Route for Post-Survey
+# ------------------------------
+@api_bp.route('/postSurvey', methods=['GET', 'POST'])
+@jwt_required()
+def api_postsurvey():
+    user_id = get_jwt_identity()
+    
+    if request.method == 'GET':
+        track_activity_start(user_id, 'postsurvey')
+        questions = list(mongo.db.postSurveyQuestion.find({}, {'_id': 0}))
+        return jsonify({'questions': questions})
+    
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'message': 'No data provided'}), 400
+            
+            # Retrieve questions to validate answers
+            questions = list(mongo.db.postSurveyQuestion.find())
+            answers = {}
+            
+            for question in questions:
+                key = f"question_{question['_id']}"
+                answer = data.get(key)
+                if answer:
+                    answers[key] = answer
+            
+            if len(answers) != len(questions):
+                return jsonify({'status': 'error', 'message': 'Please answer all questions', 'answers_received': answers}), 400
+            
+            submission = {
+                'user_id': user_id,
+                'answers': answers,
+                'submitted_at': datetime.datetime.now(datetime.UTC)
+            }
+            
+            mongo.db.postSurveyAnswers.insert_one(submission)
+            track_activity_end(user_id, 'postsurvey')
+            
+            # Update user status as complete
+            mongo.db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.UTC)}}
+            )
+            
+            return jsonify({'status': 'success', 'message': 'Survey submitted successfully'})
+        
+        except Exception as e:
+            print("Error in postSurvey:", str(e))
+            traceback.print_exc()
+            return jsonify({'status': 'error', 'message': 'An error occurred while submitting the survey'}), 500
+
+# ------------------------------
+# API Route for Completion Page
+# ------------------------------
+@api_bp.route('/completion', methods=['GET'])
+@jwt_required()
+def api_completion():
+    try:
+        user_id = get_jwt_identity()
+        # Retrieve additional user info if necessary (e.g. name)
+        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        user_name = user.get('name') if user else 'User'
+        now = datetime.datetime.now()
+        
+        return jsonify({
+            'status': 'success',
+            'completion': {
+                'user_name': user_name,
+                'timestamp': now.isoformat()
+            }
+        })
+    
+    except Exception as e:
+        print("Error in completion route:", str(e))
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': 'Could not load completion data'}), 500
+
 
 app.register_blueprint(api_bp, url_prefix='/api')
 

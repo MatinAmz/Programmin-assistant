@@ -1,11 +1,11 @@
-from flask import Flask,Blueprint, render_template, request, redirect, url_for, flash, jsonify, make_response
+from flask import Flask, Blueprint, render_template, request, redirect, url_for, flash, jsonify, make_response
+import random
 from flask_pymongo import PyMongo
 from flask_login import LoginManager, UserMixin, current_user, login_user, logout_user, login_required
 from itsdangerous import SignatureExpired
 from form import LoginForm, RegistrationForm, ForgotPasswordForm
 from bson.objectid import ObjectId
 from flask_mail import Mail, Message
-import random
 import string
 import math
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired
@@ -16,8 +16,8 @@ import tempfile
 import os
 import traceback
 import sys
-from bson import ObjectId
 import datetime
+import pytz  # Added for proper timezone handling
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
@@ -25,6 +25,8 @@ from flask_wtf.csrf import CSRFProtect
 from flask_cors import CORS
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from flask_jwt_extended import JWTManager
+import io
+
 
 
 app = Flask(__name__)
@@ -34,7 +36,7 @@ CORS(app,resources={r"/api/*": {"origins": ["http://localhost:8080","https://und
 
 app.config['MONGO_DBNAME'] = 'webapp'
 app.config['SECRET_KEY'] = '***REDACTED-FLASK-SECRET-KEY***'
-app.config['MONGO_URI'] = 'mongodb+srv://matinamoozadeh2020:J2BNxqWm8aDyF8QV@webapp.avtjo.mongodb.net/webapp?retryWrites=true&w=majority'
+app.config['MONGO_URI'] = 'mongodb+srv://<REDACTED>@<REDACTED>/webapp?retryWrites=true&w=majority'
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 465
 app.config['MAIL_USERNAME'] = 'matin.amoozadeh2020@gmail.com' 
@@ -61,16 +63,14 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 
-
-def initialize_user_activities_collection():
+def initialize_conversations_collection():
     with app.app_context():
-        if 'user_activities' not in mongo.db.list_collection_names():
-            mongo.db.create_collection('user_activities')
-            # Create indexes for faster queries
-            mongo.db.user_activities.create_index([('user_id', 1)])
-            mongo.db.user_activities.create_index([('activity', 1)])
+        if 'conversations' not in mongo.db.list_collection_names():
+            mongo.db.create_collection('conversations')
+            # Indexes for fast queries
+            mongo.db.conversations.create_index([('user_id', 1), ('question_id', 1)], unique=True)
 
-initialize_user_activities_collection()
+initialize_conversations_collection()
 
 def track_activity_start(user_id, activity):
     """Record when a user starts an activity"""
@@ -143,6 +143,7 @@ class User(UserMixin):
        self.id = str(user_data['_id'])
        self.name = user_data['name']
        self.email = user_data['email']
+       self.research_group = user_data.get('research_group', 'experiment')  # Updated default
 
 
 @login_manager.user_loader
@@ -170,7 +171,23 @@ def register():
             'email': form.email.data,
             'password': hashed_password.decode('utf-8')  # Decode to save as string
         }
-        mongo.db.users.insert_one(user)
+        result = mongo.db.users.insert_one(user)
+        
+        # NEW: Assign research group randomly during registration
+        inserted_id = result.inserted_id
+        group = random.choice(['experiment', 'control'])
+        mongo.db.users.update_one(
+            {'_id': inserted_id},
+            {'$set': {'research_group': group}}
+        )
+        # Log the assignment (optional, for auditing)
+        mongo.db.user_activities.insert_one({
+            'user_id': str(inserted_id),
+            'activity': 'group_assignment',
+            'group': group,
+            'timestamp': datetime.datetime.utcnow()
+        })
+        
         flash('Registration successful!')
         return redirect(url_for('login'))
     
@@ -179,16 +196,29 @@ def register():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-   form = LoginForm()
-   if form.validate_on_submit():
-       user = mongo.db.users.find_one({'email': form.email.data})
-
-       if user and bcrypt.checkpw(form.password.data.encode('utf-8'), user['password'].encode('utf-8')):
-           user_obj = User(user)
-           login_user(user_obj)
-           return redirect(url_for('presurvey'))
-       flash('Invalid email or password')
-   return render_template('auth/login.html', title='Login', form=form)
+    form = LoginForm()
+    if form.validate_on_submit():
+        user_data = mongo.db.users.find_one({'email': form.email.data})
+        if user_data and bcrypt.checkpw(form.password.data.encode('utf-8'), user_data['password'].encode('utf-8')):
+            # Check if group is assigned; if not, randomize
+            if 'research_group' not in user_data or not user_data['research_group']:
+                group = random.choice(['experiment', 'control'])
+                mongo.db.users.update_one(
+                    {'_id': user_data['_id']},
+                    {'$set': {'research_group': group}}
+                )
+                # Log the assignment (optional, for auditing)
+                mongo.db.user_activities.insert_one({
+                    'user_id': str(user_data['_id']),
+                    'activity': 'group_assignment',
+                    'group': group,
+                    'timestamp': datetime.datetime.utcnow()
+                })
+            user_obj = User(user_data)
+            login_user(user_obj)
+            return redirect(url_for('presurvey'))
+        flash('Invalid email or password')
+    return render_template('auth/login.html', title='Login', form=form)
 
 
 @app.route('/forgot-password', methods=['GET', 'POST'])
@@ -497,6 +527,7 @@ def autosave_code(page_num):
         print(f"Autosave error: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
     
+
 @app.route('/programming/<page_num>')
 @login_required
 def programming_question(page_num):
@@ -553,11 +584,31 @@ def programming_question(page_num):
         else:
             timer_duration = 30  # Default is 30 minutes
         
-        return render_template('programming/programming.html',
-                          question=question,
-                          code=code,
-                          page_num=page_num,
-                          timer_duration=timer_duration)  # Pass timer duration to template
+        # Check user's research group and render appropriate template
+        group = getattr(current_user, 'research_group', 'experiment')  # Default to experiment if not set
+        if group == 'control':
+            # Control group: Custom SRL prompts (hardcoded example; you can fetch from DB)
+            srl_prompts = [
+                "What is your learning goal for this programming task?",
+                "How do you plan to approach solving this problem?",
+                "What strategies will you use to test and debug your code?",
+                "Reflect on any errors: What caused them and how can you fix them?",
+                "How does this task relate to what you've learned before?"
+            ]
+            # Render SRL-specific template (create this template without AI features)
+            return render_template('programming/programming_srl.html',
+                                   question=question,
+                                   code=code,
+                                   page_num=page_num,
+                                   timer_duration=timer_duration,
+                                   srl_prompts=srl_prompts)  # Pass SRL prompts to template
+        else:
+            # Experiment group: Standard AI-assisted template
+            return render_template('programming/programming.html',
+                                   question=question,
+                                   code=code,
+                                   page_num=page_num,
+                                   timer_duration=timer_duration)  # Pass timer duration to template
                           
     except Exception as e:
         print(f"Error in programming_question: {str(e)}")
@@ -572,29 +623,103 @@ def programming_question(page_num):
 load_dotenv()
 
 # Initialize OpenAI client
-# client = OpenAI(api_key="")
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+def format_test_results(test_results):
+    """Helper to format test results as a readable string."""
+    if not test_results:
+        return "No test results available."
+    formatted = ""
+    for result in test_results:
+        formatted += f"Test: {result.get('test_name', 'Unknown')}\n"
+        formatted += f"Status: {result.get('status', 'Unknown')}\n"
+        formatted += f"Input: {result.get('input', '')}\n"
+        formatted += f"Expected: {result.get('expected', '')}\n"
+        formatted += f"Actual: {result.get('actual', '')}\n"
+        if 'error' in result:
+            formatted += f"Error: {result['error']}\n"
+        formatted += "\n"
+    return formatted
 
 @app.route('/programming/<page_num>/prompt', methods=['POST'])
 @login_required
 def programming_prompt(page_num):
     prompt = request.form.get('prompt')
     code = request.form.get('code', '')
-    
+
+    group = getattr(current_user, 'research_group', 'experiment')
+    if group == 'control':
+        # log reflection and bail (no AI)
+        mongo.db.reflections.insert_one({
+            'user_id': current_user.id,
+            'question_id': f'programming_q{page_num}',
+            'prompt': prompt,
+            'timestamp': datetime.datetime.utcnow()
+        })
+        flash('AI assistance is not available in your group.', 'warning')
+        return redirect(url_for('programming_question', page_num=page_num))
     try:
-        # Send prompt directly to ChatGPT
+        question_id = f'programming_q{page_num}'
+        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
+        question_text = question.get('question_text', 'No question text available.') if question else 'No question text available.'
+        
+        latest_run = mongo.db.run_attempts.find_one(
+            {'user_id': current_user.id, 'question_id': question_id},
+            sort=[('timestamp', -1)]
+        )
+        latest_test_results = ""
+        if latest_run:
+            if 'test_results' in latest_run:
+                latest_test_results = format_test_results(latest_run['test_results'])
+            elif 'output' in latest_run:
+                latest_test_results = latest_run['output']
+
+        # NEW: Load or initialize conversation history
+        conversation = mongo.db.conversations.find_one({
+            'user_id': current_user.id,
+            'question_id': question_id
+        })
+        history = conversation.get('history', []) if conversation else []
+
+        # Construct system content (always first in messages)
+        system_content = (
+            f"You are a helpful programming assistant. "
+            f"The programming task is: {question_text}\n"
+            f"Current code in editor: {code}\n"
+            f"Latest terminal outputs/test results: {latest_test_results or 'No previous runs.'}"
+        )
+
+        # Build messages: system + history + new user prompt
+        messages = [
+            {"role": "system", "content": system_content}
+        ] + history + [
+            {"role": "user", "content": prompt}
+        ]
+
+        # Send to ChatGPT with full history
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0.7
         )
         
         ai_response = response.choices[0].message.content
         
-        # Log the interaction (optional)
+        # NEW: Append new user prompt and AI response to history
+        history.append({"role": "user", "content": prompt})
+        history.append({"role": "assistant", "content": ai_response})
+
+        # Save/upsert updated history
+        mongo.db.conversations.update_one(
+            {'user_id': current_user.id, 'question_id': question_id},
+            {'$set': {'history': history}},
+            upsert=True
+        )
+        
+        # Log the interaction (optional, keep as-is)
         mongo.db.ai_interactions.insert_one({
             'user_id': current_user.id,
-            'question_id': f'programming_q{page_num}',
+            'question_id': question_id,
             'prompt': prompt,
             'ai_response': ai_response,
             'timestamp': datetime.datetime.utcnow()
@@ -603,11 +728,9 @@ def programming_prompt(page_num):
     except Exception as e:
         ai_response = f"Error: {str(e)}"
     
-    # For AJAX requests, return just the plain text response
     if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
         return ai_response
     
-    # For traditional form submissions, return the full page
     question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
     return render_template('programming/programming.html',
                          question=question,
@@ -688,178 +811,29 @@ def programming_submit(page_num):
         
         track_activity_end(current_user.id, f'programming_q{page_num}')
         
-        # For question 2, redirect directly to post-survey
-        if page_num == '2':
+        # Updated: No feedback; redirect based on page_num
+        if page_num == '1':
+            return redirect(url_for('programming_question', page_num='2'))
+        elif page_num == '2':
             return redirect(url_for('postsurvey'))
-        # For question 1, show feedback
         else:
-            return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
+            flash('Submission complete.', 'success')
+            return redirect(url_for('programming_question', page_num=page_num))
         
     except Exception as e:
         print("Error in submit:", str(e))
         traceback.print_exc()
         flash('Error submitting solution', 'error')
         
-        # For question 2, redirect directly to post-survey even on error
-        if page_num == '2':
+        # Updated: No feedback; redirect based on page_num even on error
+        if page_num == '1':
+            return redirect(url_for('programming_question', page_num='2'))
+        elif page_num == '2':
             return redirect(url_for('postsurvey'))
         else:
-            return redirect(url_for('feedback', question_id=f'programming_q{page_num}'))
+            return redirect(url_for('programming_question', page_num=page_num))
 
-@app.route('/feedback/<question_id>')
-@login_required
-def feedback(question_id):
-    try:
-        # Get real personal usage count
-        personal_usage_count = mongo.db.ai_interactions.count_documents({
-            'user_id': current_user.id,
-            'question_id': question_id
-        })
-        
-        # If user never used AI, set usage percentage to 0
-        # Otherwise, generate a random percentage for comparison
-        import random
-        if personal_usage_count == 0:
-            usage_percentage = 0
-        else:
-            usage_percentage = random.randint(40, 90)
-        
-        # Get the start and end time for this question using user activities
-        activity_record = mongo.db.user_activities.find_one({
-            'user_id': current_user.id,
-            'activity': question_id,
-            'end_time': {'$ne': None}  # Make sure the activity has ended
-        }, sort=[('end_time', -1)])  # Get the most recent completed activity
-        
-        if activity_record and activity_record.get('start_time') and activity_record.get('end_time'):
-            start_time = activity_record['start_time']
-            end_time = activity_record['end_time']
-            print(f"Using activity tracking: start={start_time}, end={end_time}")
-        else:
-            # Fallback - check the submission timestamp
-            submission = mongo.db.submissions.find_one({
-                'user_id': current_user.id,
-                'question_id': question_id
-            })
-            
-            if submission and submission.get('timestamp'):
-                end_time = submission['timestamp']
-                # Estimate start time based on question
-                if question_id == 'programming_q1':
-                    duration = 20  # minutes
-                else:
-                    duration = 30  # minutes
-                start_time = end_time - datetime.timedelta(minutes=duration)
-                print(f"Using submission time with estimated duration: start={start_time}, end={end_time}")
-            else:
-                # Last resort - use AI interactions if any
-                interactions = list(mongo.db.ai_interactions.find({
-                    'user_id': current_user.id,
-                    'question_id': question_id
-                }).sort('timestamp', 1))
-                
-                if interactions and len(interactions) > 0:
-                    start_time = interactions[0]['timestamp']
-                    end_time = interactions[-1]['timestamp']
-                    # Ensure we have at least a 10-minute window
-                    if (end_time - start_time).total_seconds() < 600:
-                        end_time = start_time + datetime.timedelta(minutes=10)
-                    print(f"Using interaction times: start={start_time}, end={end_time}")
-                else:
-                    # Final fallback - just use current time with default duration
-                    end_time = datetime.datetime.utcnow()
-                    start_time = end_time - datetime.timedelta(minutes=20)
-                    print(f"Using default times: start={start_time}, end={end_time}")
-        
-        # Force a minimum duration based on the question
-        min_duration = 20 if question_id == 'programming_q1' else 30  # minutes
-        
-        # Calculate total duration in minutes (rounded up to nearest 2 minutes)
-        total_duration = max(min_duration, (end_time - start_time).total_seconds() / 60)
-        total_duration_rounded = math.ceil(total_duration / 2) * 2  # Round up to nearest 2
-        
-        print(f"Total duration: {total_duration} minutes, rounded to {total_duration_rounded} minutes")
-        
-        # Create 2-minute intervals
-        time_intervals = []
-        interval_counts = []
-        
-        # Start from 2 minutes and go up to the total duration, stepping by 2
-        for minute in range(2, int(total_duration_rounded) + 1, 2):
-            time_intervals.append(str(minute))
-            
-            # Count interactions in this 2-minute interval
-            interval_start = start_time + datetime.timedelta(minutes=minute-2)
-            interval_end = start_time + datetime.timedelta(minutes=minute)
-            
-            count = mongo.db.ai_interactions.count_documents({
-                'user_id': current_user.id,
-                'question_id': question_id,
-                'timestamp': {
-                    '$gte': interval_start,
-                    '$lt': interval_end
-                }
-            })
-            
-            interval_counts.append(count)
-        
-        # Debug print the intervals and counts
-        print(f"Time intervals: {time_intervals}")
-        print(f"Interval counts: {interval_counts}")
-        
-        # Prepare time data for template
-        time_data = {
-            'labels': time_intervals,
-            'values': interval_counts
-        }
-        
-        # Set the next page to programming question 2 or post-survey
-        page_num = question_id.replace('programming_q', '')
-        if page_num == '1':
-            next_page_num = '2'
-            next_url = url_for('programming_question', page_num=next_page_num)
-        else:
-            next_page_num = 'survey'
-            next_url = url_for('postsurvey')
-        
-        # Save feedback data to MongoDB for this user
-        feedback_data = {
-            'user_id': current_user.id,
-            'question_id': question_id,
-            'timestamp': datetime.datetime.now(datetime.UTC),
-            'personal_usage_count': personal_usage_count,
-            'usage_percentage': usage_percentage,
-            'time_data': time_data,
-            'session_start': start_time,
-            'session_end': end_time,
-            'session_duration_minutes': total_duration
-        }
-        
-        # Save to MongoDB using upsert
-        mongo.db.feedback.update_one(
-            {
-                'user_id': current_user.id,
-                'question_id': question_id
-            },
-            {'$set': feedback_data},
-            upsert=True
-        )
-
-        # Include next_url in the template context
-        return render_template('feedback/feedback.html',
-            question_id=question_id,
-            personal_usage_count=personal_usage_count,
-            usage_percentage=usage_percentage,
-            time_data=time_data,
-            next_page_num=next_page_num,
-            next_url=next_url
-        )
-
-    except Exception as e:
-        print(f"Error in feedback route: {str(e)}")
-        traceback.print_exc()
-        flash('Error loading feedback data', 'error')
-        return render_template('feedback/feedback.html', question_id=question_id)
+# (Feedback route removed as per request)
 
 @app.route('/postSurvey', methods=['GET', 'POST'])
 @login_required
@@ -903,7 +877,6 @@ def postsurvey():
                 'submitted_at': datetime.datetime.now(datetime.UTC)
             }
             
-           
             mongo.db.postSurveyAnswers.insert_one(submission)
             track_activity_end(current_user.id, 'postsurvey')
             # Update user status to indicate completion of the entire process
@@ -968,48 +941,177 @@ def check_token():
         'user_id': current_user_id
     }), 200
 
+def _insert_login_log(email, user_id):
+    """
+    Helper to insert a login log for `email`. Uses a global counter
+    'login_sequence' in login_logs collection.
+    """
+    # Find the document with the highest existing login_sequence
+    last_log = mongo.db.login_logs.find_one(sort=[("login_sequence", -1)])
+    if last_log and "login_sequence" in last_log:
+        next_sequence = last_log["login_sequence"] + 1
+    else:
+        next_sequence = 1
 
-# Separate endpoint for Microsoft login via POST from Vue
+    # Current time in US Central / America/Chicago via pytz
+    now_central = datetime.datetime.now(pytz.timezone('America/Chicago'))
+
+    # Build and insert the login_log
+    login_log = {
+        "user_id": user_id,
+        "email": email,
+        "login_sequence": next_sequence,
+        "time": now_central
+    }
+    mongo.db.login_logs.insert_one(login_log)
+
 @api_bp.route('/microsoft_login', methods=['POST'])
 def microsoft_login():
     data = request.get_json()
     if not data:
-         return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
+        return jsonify({"status": "error", "message": "No input data provided"}), 400
 
-    email = data.get('email').lower()
-    name = data.get('name')
+    email = data.get("email", "").lower()
+    name = data.get("name")
     if not email or not name:
-         return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
+        return jsonify({"status": "error", "message": "Missing required fields"}), 400
 
-    # Check if user exists in the database.
-    existing_user = mongo.db.users.find_one({'email': email})
+    # find-or-create
+    existing_user = mongo.db.users.find_one({"email": email})
     if existing_user:
-         user_id = str(existing_user['_id'])
+        user_id = str(existing_user["_id"])
     else:
-         # Create a new user with a random password.
-         import uuid
-         random_password = str(uuid.uuid4())
-         hashed_password = bcrypt.hashpw(random_password.encode('utf-8'), bcrypt.gensalt())
-         new_user = {
-             'name': name,
-             'email': email,
-             'password': hashed_password.decode('utf-8')
-         }
-         result = mongo.db.users.insert_one(new_user)
-         user_id = str(result.inserted_id)
+        import uuid
+        random_password = str(uuid.uuid4())
+        hashed_password = bcrypt.hashpw(random_password.encode("utf-8"), bcrypt.gensalt())
+        new_user = {
+            "name": name,
+            "email": email,
+            "password": hashed_password.decode("utf-8"),
+        }
+        result = mongo.db.users.insert_one(new_user)
+        user_id = str(result.inserted_id)
 
-    # Create your JWT token.
+    # Check and assign research group if not set (randomization)
+    try:
+        user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        if 'research_group' not in user_data or not user_data['research_group']:
+            group = random.choice(['experiment', 'control'])
+            mongo.db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$set': {'research_group': group}}
+            )
+            # Log the assignment for auditing
+            mongo.db.user_activities.insert_one({
+                'user_id': user_id,
+                'activity': 'group_assignment',
+                'group': group,
+                'timestamp': datetime.datetime.utcnow()
+            })
+    except Exception as e:
+        print(f"Error assigning research group: {str(e)}")
+        # Continue even if assignment fails (you can add error response if needed)
+
+    # log it
+    _insert_login_log(email, user_id)
+
+    # create JWT
     access_token = create_access_token(identity=user_id, expires_delta=datetime.timedelta(hours=1))
+
+    # --- check previous submissions ---
+    presurvey_submitted = mongo.db.preSurveyAnswers.find_one(
+        {'user_id': user_id}
+    ) is not None
+
+    pq1_submitted = mongo.db.submissions.find_one(
+        {'user_id': user_id, 'question_id': 'programming_q1'}
+    ) is not None
+
+    pq2_submitted = mongo.db.submissions.find_one(
+        {'user_id': user_id, 'question_id': 'programming_q2'}
+    ) is not None
+
     return jsonify({
-         'status': 'success',
-         'message': 'Microsoft login successful!',
-         'access_token': access_token,
-         'user': {
-             'id': user_id,
-             'name': name,
-             'email': email
-         }
+        "status": "success",
+        "message": "Microsoft login successful!",
+        "access_token": access_token,
+        "user": {"id": user_id, "name": name, "email": email},
+        "presurvey_submitted": presurvey_submitted,
+        "programming_q1_submitted": pq1_submitted,
+        "programming_q2_submitted": pq2_submitted
     })
+
+@api_bp.route('/login', methods=['POST'])
+def api_login():
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "message": "No input data provided"}), 400
+
+    email = data.get("email")
+    password = data.get("password")
+    if not email or not password:
+        return jsonify({"status": "error", "message": "Missing email or password"}), 400
+
+    user = mongo.db.users.find_one({"email": email})
+    if user and bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")):
+        user_id = str(user["_id"])
+
+        # Check and assign research group if not set (randomization)
+        try:
+            user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+            if 'research_group' not in user_data or not user_data['research_group']:
+                group = random.choice(['experiment', 'control'])
+                mongo.db.users.update_one(
+                    {'_id': ObjectId(user_id)},
+                    {'$set': {'research_group': group}}
+                )
+                # Log the assignment for auditing
+                mongo.db.user_activities.insert_one({
+                    'user_id': user_id,
+                    'activity': 'group_assignment',
+                    'group': group,
+                    'timestamp': datetime.datetime.utcnow()
+                })
+        except Exception as e:
+            print(f"Error assigning research group: {str(e)}")
+            # Continue even if assignment fails (you can add error response if needed)
+
+        # log the login
+        _insert_login_log(email, user_id)
+
+        # create JWT
+        access_token = create_access_token(identity=user_id, expires_delta=datetime.timedelta(days=1))
+
+        # --- check previous submissions ---
+        presurvey_submitted = mongo.db.preSurveyAnswers.find_one(
+            {'user_id': user_id}
+        ) is not None
+
+        pq1_submitted = mongo.db.submissions.find_one(
+            {'user_id': user_id, 'question_id': 'programming_q1'}
+        ) is not None
+
+        pq2_submitted = mongo.db.submissions.find_one(
+            {'user_id': user_id, 'question_id': 'programming_q2'}
+        ) is not None
+
+        return jsonify({
+            "status": "success",
+            "message": "Login successful!",
+            "access_token": access_token,
+            "user": {
+                "id": user_id,
+                "name": user.get("name"),
+                "email": user.get("email"),
+                'research_group': user.get('research_group', 'experiment')
+            },
+            "presurvey_submitted": presurvey_submitted,
+            "programming_q1_submitted": pq1_submitted,
+            "programming_q2_submitted": pq2_submitted
+        })
+    else:
+        return jsonify({"status": "error", "message": "Invalid email or password"}), 401
+
 
 @api_bp.route('/register', methods=['POST'])
 def api_register():
@@ -1037,45 +1139,31 @@ def api_register():
     result = mongo.db.users.insert_one(user)
     new_user = mongo.db.users.find_one({'_id': result.inserted_id})
 
+    # NEW: Assign research group randomly during registration
+    group = random.choice(['experiment', 'control'])
+    mongo.db.users.update_one(
+        {'_id': result.inserted_id},
+        {'$set': {'research_group': group}}
+    )
+    # Log the assignment
+    mongo.db.user_activities.insert_one({
+        'user_id': str(result.inserted_id),
+        'activity': 'group_assignment',
+        'group': group,
+        'timestamp': datetime.datetime.utcnow()
+    })
+
     return jsonify({
         'status': 'success',
         'message': 'Registration successful!',
         'user': {
             'id': str(new_user['_id']),
             'name': new_user['name'],
-            'email': new_user['email']
+            'email': new_user['email'],
+            'research_group': group 
         }
     }), 201
 
-@api_bp.route('/login', methods=['POST'])
-def api_login():
-    data = request.get_json()
-    if not data:
-        return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
-
-    email = data.get('email')
-    password = data.get('password')
-    if not email or not password:
-        return jsonify({'status': 'error', 'message': 'Missing email or password'}), 400
-
-    user = mongo.db.users.find_one({'email': email})
-    if user and bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
-        # Create a token with an expiration time (optional)
-        access_token = create_access_token(identity=str(user['_id']),
-                                           expires_delta=datetime.timedelta(days=1))
-        return jsonify({
-            'status': 'success',
-            'message': 'Login successful!',
-            'access_token': access_token,
-            'user': {
-                'id': str(user['_id']),
-                'name': user.get('name'),
-                'email': user.get('email')
-            }
-        })
-    else:
-        return jsonify({'status': 'error', 'message': 'Invalid email or password'}), 401
-    
 
 @api_bp.route('/forgot-password', methods=['POST'])
 def api_forgot_password():
@@ -1182,29 +1270,6 @@ def api_programming_question(page_num):
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-# feedback endpoint updated for JWT
-# @api_bp.route('/feedback', methods=['GET'])
-# @jwt_required()
-# def api_feedback():
-#     try:
-#         user_id = get_jwt_identity()
-#         feedback_data = mongo.db.feedback.find_one({'user_id': user_id})
-        
-#         if not feedback_data:
-#             return jsonify({'status': 'error', 'message': 'Feedback data not found'}), 404
-            
-#         # Convert ObjectId fields and datetime fields to strings
-#         feedback_data['_id'] = str(feedback_data['_id'])
-#         feedback_data['timestamp'] = feedback_data['timestamp'].isoformat()
-        
-#         return jsonify({
-#             'status': 'success',
-#             'feedback': feedback_data
-#         }), 200
-#     except Exception as e:
-#         return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
 # New routes
 @api_bp.route('/programming/<page_num>/autosave', methods=['POST'])
 @jwt_required()
@@ -1234,6 +1299,9 @@ def autosave_code(page_num):
 def programming_question(page_num):
     try:
         current_user_id = get_jwt_identity()
+        user_data = mongo.db.users.find_one({'_id': ObjectId(current_user_id)})
+        group = user_data.get('research_group', 'experiment')  # Fetch from DB
+        
         question_id = f'programming_q{page_num}'
         
         # Track activity start (errors are caught and logged)
@@ -1273,24 +1341,39 @@ def programming_question(page_num):
         else:
             timer_duration = 30  # Default is 30 minutes
         
-        return jsonify({
+        response = {
             'status': 'success',
             'question': question,
             'code': code,
             'page_num': page_num,
-            'timer_duration': timer_duration
-        })
+            'timer_duration': timer_duration,
+            'ai_mode': 'free' if group == 'control' else 'srl'
+        }
+        
+        if group == 'experiment':
+            # Provide SRL prompts for control group
+            srl_prompts = [
+                "What is your learning goal for this programming task?",
+                "How do you plan to approach solving this problem?",
+                "What strategies will you use to test and debug your code?",
+                "Reflect on any errors: What caused them and how can you fix them?",
+                "How does this task relate to what you've learned before?"
+            ]  # Or fetch from DB
+            response['srl_prompts'] = srl_prompts
+        
+        return jsonify(response)
     except Exception as e:
         print(f"Error in programming_question: {str(e)}")
         return jsonify({'status': 'error', 'message': 'Error loading programming question'}), 500
 
-
-# Modified programming prompt route
 @api_bp.route('/programming/<page_num>/prompt', methods=['POST'])
 @jwt_required()
 def programming_prompt(page_num):
     current_user_id = get_jwt_identity()
-    data = request.get_json()  # Expecting JSON body with keys 'prompt' and optionally 'code'
+    user_data = mongo.db.users.find_one({'_id': ObjectId(current_user_id)})
+    group = user_data.get('research_group', 'experiment')
+
+    data = request.get_json()
     prompt = data.get('prompt')
     code = data.get('code', '')
 
@@ -1298,18 +1381,74 @@ def programming_prompt(page_num):
         return jsonify({'status': 'error', 'message': 'Prompt is required'}), 400
 
     try:
-        # Send prompt to ChatGPT (example using your client)
+        question_id = f'programming_q{page_num}'
+        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
+        question_text = question.get('question_text', 'No question text available.') if question else 'No question text available.'
+
+        latest_run = mongo.db.run_attempts.find_one(
+            {'user_id': current_user_id, 'question_id': question_id},
+            sort=[('timestamp', -1)]
+        )
+        latest_test_results = ""
+        if latest_run:
+            if 'test_results' in latest_run:
+                latest_test_results = format_test_results(latest_run['test_results'])
+            elif 'output' in latest_run:
+                latest_test_results = latest_run['output']
+
+        # Load or initialize conversation history
+        conversation = mongo.db.conversations.find_one({
+            'user_id': current_user_id,
+            'question_id': question_id
+        })
+        history = conversation.get('history', []) if conversation else []
+
+        # ----- Different system prompts depending on group -----
+        if group == 'control':
+            # Free AI assistant mode
+            system_content = (
+                f"You are a helpful programming assistant.\n"
+                f"Programming task: {question_text}\n"
+                f"Current code in editor: {code}\n"
+                f"Latest terminal outputs/test results: {latest_test_results or 'No previous runs.'}"
+            )
+            user_message = prompt
+        else:
+            # SRL (planning / monitoring / reflection) mode
+            system_content = (
+                f"You are a programming learning companion.\n"
+                f"Student is solving: {question_text}\n"
+                f"Current code: {code}\n"
+                f"Latest results: {latest_test_results or 'No previous runs.'}\n\n"
+                f"Encourage self-regulated learning (planning, monitoring, reflection)."
+            )
+            user_message = f"Student reflection: {prompt}"
+
+        # Build messages
+        messages = [{"role": "system", "content": system_content}] + history + [{"role": "user", "content": user_message}]
+
+        # Call OpenAI
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0.7
         )
         ai_response = response.choices[0].message.content
 
-        # Log the interaction
+        # Update history
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": ai_response})
+        mongo.db.conversations.update_one(
+            {'user_id': current_user_id, 'question_id': question_id},
+            {'$set': {'history': history}},
+            upsert=True
+        )
+
+        # Log interaction
         mongo.db.ai_interactions.insert_one({
             'user_id': current_user_id,
-            'question_id': f'programming_q{page_num}',
+            'question_id': question_id,
+            'group': group,
             'prompt': prompt,
             'ai_response': ai_response,
             'timestamp': datetime.datetime.utcnow()
@@ -1327,44 +1466,47 @@ def programming_prompt(page_num):
 
 
 
-# Modified programming run route
 @api_bp.route('/programming/<page_num>/run', methods=['POST'])
 @jwt_required()
 def programming_run(page_num):
     current_user_id = get_jwt_identity()
-    data = request.get_json()  # Expecting JSON body with key 'code'
+    data = request.get_json()  
     code = data.get('code')
-
+ 
     if not code:
         return jsonify({'status': 'error', 'message': 'Code is required'}), 400
-
+ 
     question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
     if not question:
         return jsonify({'status': 'error', 'message': 'Question not found'}), 404
-
-    # Get test cases from the question and run the tests
-    test_cases = question.get('test_cases', [])
-    test_results = run_code_with_test_cases(code, test_cases)
-
-    # Log the run attempt
+ 
+    # Run the user-submitted code
+    output = run_code_simple(code)
+ 
+    # Save the code and output to MongoDB
     mongo.db.run_attempts.insert_one({
         'user_id': current_user_id,
         'question_id': f'programming_q{page_num}',
         'code': code,
-        'test_results': test_results,
+        'output': output,
         'timestamp': datetime.datetime.utcnow()
     })
-
+ 
+    # Return response with output
     return jsonify({
-        'question': question,
+        'status': 'success',
+        'question': {
+            'title': question.get('title'),
+            'description': question.get('description'),
+            'question_id': question.get('question_id')
+        },
         'code': code,
-        'page_num': page_num,
-        'test_results': test_results
+        'output': output,
+        'page_num': page_num
     })
-
-
-
-# Modified programming submit route
+ 
+ 
+# Modified programming submit route with login_sequence check
 @api_bp.route('/programming/<page_num>/submit', methods=['POST'])
 @jwt_required()
 def programming_submit(page_num):
@@ -1392,7 +1534,7 @@ def programming_submit(page_num):
         'code': code,
         'test_results': test_results,
         'score': score,
-        'timestamp': datetime.datetime.now(datetime.UTC)
+        'timestamp': datetime.datetime.now(datetime.timezone.utc)
     }
 
     # Save submission using upsert
@@ -1407,136 +1549,167 @@ def programming_submit(page_num):
 
     track_activity_end(current_user_id, f'programming_q{page_num}')
 
-    # Instead of redirects, return a JSON response
+    # Fetch the most recent login_log for this user
+    last_log = mongo.db.login_logs.find_one(
+        {'user_id': current_user_id},
+        sort=[('login_sequence', -1)]
+    )
+
+    if last_log and (last_log['login_sequence'] % 2 == 1):
+        # If login_sequence is odd, direct to programming question 2
+        return jsonify({
+            'status': 'success',
+            'message': 'Submission saved. Please proceed to programming question 2.'
+        })
+
+    # Otherwise, use the existing page-based logic (updated: no feedback mention)
     if page_num == '2':
         return jsonify({'status': 'success', 'message': 'Submission saved. Please proceed to postsurvey.'})
     else:
-        return jsonify({'status': 'success', 'message': 'Submission saved. Feedback is available.'})
-
-
-
-@api_bp.route('/feedback/<question_id>', methods=['GET'])
-@jwt_required()
-def api_feedback(question_id):
-    try:
-        user_id = get_jwt_identity()  # Get the user ID from the JWT
-        
-        # Count AI interactions for this user and question
-        personal_usage_count = mongo.db.ai_interactions.count_documents({
-            'user_id': user_id,
-            'question_id': question_id
-        })
-        
-        # Determine usage percentage
-        usage_percentage = 0 if personal_usage_count == 0 else random.randint(40, 90)
-        
-        # Get the most recent activity record for this question
-        activity_record = mongo.db.user_activities.find_one({
-            'user_id': user_id,
-            'activity': question_id,
-            'end_time': {'$ne': None}
-        }, sort=[('end_time', -1)])
-        
-        if activity_record and activity_record.get('start_time') and activity_record.get('end_time'):
-            start_time = activity_record['start_time']
-            end_time = activity_record['end_time']
-        else:
-            # Fallback: check submission timestamp
-            submission = mongo.db.submissions.find_one({
-                'user_id': user_id,
-                'question_id': question_id
-            })
-            
-            if submission and submission.get('timestamp'):
-                end_time = submission['timestamp']
-                duration = 20 if question_id == 'programming_q1' else 30
-                start_time = end_time - datetime.timedelta(minutes=duration)
-            else:
-                # Final fallback: use AI interactions or default times
-                interactions = list(mongo.db.ai_interactions.find({
-                    'user_id': user_id,
-                    'question_id': question_id
-                }).sort('timestamp', 1))
-                
-                if interactions:
-                    start_time = interactions[0]['timestamp']
-                    end_time = interactions[-1]['timestamp']
-                    if (end_time - start_time).total_seconds() < 600:
-                        end_time = start_time + datetime.timedelta(minutes=10)
-                else:
-                    end_time = datetime.datetime.utcnow()
-                    start_time = end_time - datetime.timedelta(minutes=20)
-        
-        # Ensure a minimum session duration
-        min_duration = 20 if question_id == 'programming_q1' else 30
-        total_duration = max(min_duration, (end_time - start_time).total_seconds() / 60)
-        total_duration_rounded = math.ceil(total_duration / 2) * 2  # Rounded up to nearest 2 minutes
-        
-        # Create 2-minute intervals and count interactions for each
-        time_intervals = []
-        interval_counts = []
-        for minute in range(2, int(total_duration_rounded) + 1, 2):
-            time_intervals.append(str(minute))
-            interval_start = start_time + datetime.timedelta(minutes=minute-2)
-            interval_end = start_time + datetime.timedelta(minutes=minute)
-            count = mongo.db.ai_interactions.count_documents({
-                'user_id': user_id,
-                'question_id': question_id,
-                'timestamp': {
-                    '$gte': interval_start,
-                    '$lt': interval_end
-                }
-            })
-            interval_counts.append(count)
-        
-        time_data = {
-            'labels': time_intervals,
-            'values': interval_counts
-        }
-        
-        # Determine next step based on question_id
-        page_num = question_id.replace('programming_q', '')
-        if page_num == '1':
-            next_page_num = '2'
-            next_url = url_for('programming_question', page_num=next_page_num)
-        else:
-            next_page_num = 'survey'
-            next_url = url_for('api_postsurvey')
-        
-        # Prepare feedback data
-        feedback_data = {
-            'user_id': user_id,
-            'question_id': question_id,
-            'timestamp': datetime.datetime.now(datetime.UTC),
-            'personal_usage_count': personal_usage_count,
-            'usage_percentage': usage_percentage,
-            'time_data': time_data,
-            'session_start': start_time,
-            'session_end': end_time,
-            'session_duration_minutes': total_duration
-        }
-        
-        # Save feedback data with upsert
-        mongo.db.feedback.update_one(
-            {'user_id': user_id, 'question_id': question_id},
-            {'$set': feedback_data},
-            upsert=True
-        )
-        
-        # Return feedback information as JSON
-        return jsonify({
-            'status': 'success',
-            'feedback': feedback_data,
-            'next': {
-                'page_num': next_page_num,
-                'url': next_url
-            }
-        })
+        return jsonify({'status': 'success', 'message': 'Submission saved. Proceed to next question.'})
     
-    except Exception as e:
-        print(f"Error in feedback route: {str(e)}")
-        traceback.print_exc()
-        return jsonify({'status': 'error', 'message': 'Error loading feedback data'}), 500
+
+@app.route('/debug/conversations/<user_id>/<question_id>', methods=['GET'])
+@login_required  
+def debug_conversations(user_id, question_id):
+    conversation = mongo.db.conversations.find_one({
+        'user_id': user_id,
+        'question_id': question_id
+    })
+    if conversation:
+        return jsonify(conversation['history'])
+    else:
+        return jsonify({'message': 'No conversation found'}), 404
+
+# @api_bp.route('/feedback/<question_id>', methods=['GET'])
+# @jwt_required()
+# def api_feedback(question_id):
+#     try:
+#         question_id = f'programming_q{question_id}'
+#         user_id = get_jwt_identity()  # Get the user ID from the JWT
+#         user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+#         group = user_data.get('research_group', 'experiment')
+#         print(user_id)
+#         # Count AI interactions for this user and question
+#         personal_usage_count = mongo.db.ai_interactions.count_documents({
+#             'user_id': user_id,
+#             'question_id': question_id
+#         })
+#         
+#         # Determine usage percentage
+#         usage_percentage = 0 if personal_usage_count == 0 else random.randint(40, 90)
+#         
+#         # Get the most recent activity record for this question
+#         activity_record = mongo.db.user_activities.find_one({
+#             'user_id': user_id,
+#             'activity': question_id,
+#             'end_time': {'$ne': None}
+#         }, sort=[('end_time', -1)])
+#         
+#         if activity_record and activity_record.get('start_time') and activity_record.get('end_time'):
+#             start_time = activity_record['start_time']
+#             end_time = activity_record['end_time']
+#         else:
+#             # Fallback: check submission timestamp
+#             submission = mongo.db.submissions.find_one({
+#                 'user_id': user_id,
+#                 'question_id': question_id
+#             })
+#             
+#             if submission and submission.get('timestamp'):
+#                 end_time = submission['timestamp']
+#                 duration = 20 if question_id == 'programming_q1' else 30
+#                 start_time = end_time - datetime.timedelta(minutes=duration)
+#             else:
+#                 # Final fallback: use AI interactions or default times
+#                 interactions = list(mongo.db.ai_interactions.find({
+#                     'user_id': user_id,
+#                     'question_id': question_id
+#                 }).sort('timestamp', 1))
+#                 
+#                 if interactions:
+#                     start_time = interactions[0]['timestamp']
+#                     end_time = interactions[-1]['timestamp']
+#                     if (end_time - start_time).total_seconds() < 600:
+#                         end_time = start_time + datetime.timedelta(minutes=10)
+#                 else:
+#                     end_time = datetime.datetime.utcnow()
+#                     start_time = end_time - datetime.timedelta(minutes=20)
+#         
+#         # Ensure a minimum session duration
+#         min_duration = 20 if question_id == 'programming_q1' else 30
+#         total_duration = max(min_duration, (end_time - start_time).total_seconds() / 60)
+#         total_duration_rounded = math.ceil(total_duration / 2) * 2  # Rounded up to nearest 2 minutes
+#         
+#         # Create 2-minute intervals and count interactions for each
+#         time_intervals = []
+#         interval_counts = []
+#         for minute in range(2, int(total_duration_rounded) + 1, 2):
+#             time_intervals.append(str(minute))
+#             interval_start = start_time + datetime.timedelta(minutes=minute-2)
+#             interval_end = start_time + datetime.timedelta(minutes=minute)
+#             count = mongo.db.ai_interactions.count_documents({
+#                 'user_id': user_id,
+#                 'question_id': question_id,
+#                 'timestamp': {
+#                     '$gte': interval_start,
+#                     '$lt': interval_end
+#                 }
+#             })
+#             interval_counts.append(count)
+#         
+#         time_data = {
+#             'labels': time_intervals,
+#             'values': interval_counts
+#         }
+#         
+#         # Determine next step based on question_id
+#         page_num = question_id.replace('programming_q', '')
+#         if page_num == '1':
+#             next_page_num = '2'
+#             next_url = url_for('programming_question', page_num=next_page_num)
+#         else:
+#             next_page_num = 'survey'
+#             next_url = url_for('api_postsurvey')
+#         
+#         # Prepare feedback data
+#         feedback_data = {
+#             'user_id': user_id,
+#             'question_id': question_id,
+#             'timestamp': datetime.datetime.now(datetime.UTC),
+#             'personal_usage_count': personal_usage_count,
+#             'usage_percentage': usage_percentage,
+#             'time_data': time_data,
+#             'session_start': start_time,
+#             'session_end': end_time,
+#             'session_duration_minutes': total_duration
+#         }
+#         
+#         if group == 'control':
+#             feedback_data['personal_usage_count'] = 0
+#             feedback_data['usage_percentage'] = 0
+#         
+#         # Save feedback data with upsert
+#         mongo.db.feedback.update_one(
+#             {'user_id': user_id, 'question_id': question_id},
+#             {'$set': feedback_data},
+#             upsert=True
+#         )
+#         
+#         # Return feedback information as JSON
+#         return jsonify({
+#             'status': 'success',
+#             'feedback': feedback_data,
+#             'next': {
+#                 'page_num': next_page_num,
+#                 'url': next_url
+#             }
+#         })
+#     
+#     except Exception as e:
+#         print(f"Error in feedback route: {str(e)}")
+#         traceback.print_exc()
+#         return jsonify({'status': 'error', 'message': 'Error loading feedback data'}), 500
 
 # ------------------------------
 # API Route for Post-Survey
@@ -1548,7 +1721,11 @@ def api_postsurvey():
     
     if request.method == 'GET':
         track_activity_start(user_id, 'postsurvey')
-        questions = list(mongo.db.postSurveyQuestion.find({}, {'_id': 0}))
+        questions = list(mongo.db.postSurveyQuestion.find({}))
+        for question in questions:
+            # If using PyMongo, question['_id'] is usually an ObjectId so str() converts it properly.
+            question['id'] = str(question['_id'])
+            del question['_id']
         return jsonify({'questions': questions})
     
     elif request.method == 'POST':
@@ -1617,6 +1794,64 @@ def api_completion():
         print("Error in completion route:", str(e))
         traceback.print_exc()
         return jsonify({'status': 'error', 'message': 'Could not load completion data'}), 500
+
+
+
+@api_bp.route('/run_code_raw', methods=['POST'])
+@jwt_required()
+def run_code_raw():
+    try:
+        current_user_id = get_jwt_identity()
+        data = request.get_json()  # Expecting JSON body with key 'code'
+        code = data.get('code')
+        if not code.strip():
+            return jsonify({'status': 'error', 'message': 'Code is empty'}), 400
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(code)
+            temp_file = f.name
+
+        # Run the code using subprocess
+        process = subprocess.Popen(
+            ['python3', temp_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate(timeout=10)
+
+        # Clean up the temp file
+        os.unlink(temp_file)
+
+        return jsonify({
+            'status': 'success',
+            'stdout': stdout.strip(),
+            'stderr': stderr.strip()
+        })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            'status': 'error',
+            'stderr': 'Execution timed out (10 seconds)'
+        }), 500
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'stderr': str(e)
+        }), 500
+
+
+def run_code_simple(code):
+    try:
+        old_stdout = sys.stdout
+        redirected_output = sys.stdout = io.StringIO()
+        exec(code, {})  
+        output = redirected_output.getvalue()
+    except Exception:
+        output = traceback.format_exc()
+    finally:
+        sys.stdout = old_stdout
+    return output
 
 
 app.register_blueprint(api_bp, url_prefix='/api')

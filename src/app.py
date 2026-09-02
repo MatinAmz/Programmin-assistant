@@ -27,7 +27,8 @@ from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identi
 from flask_jwt_extended import JWTManager
 import io
 
-
+# Load environment variables from src/.env before anything reads them.
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -35,12 +36,12 @@ CORS(app,resources={r"/api/*": {"origins": ["http://localhost:8080","https://und
 
 
 app.config['MONGO_DBNAME'] = 'webapp'
-app.config['SECRET_KEY'] = '***REDACTED-FLASK-SECRET-KEY***'
-app.config['MONGO_URI'] = 'mongodb+srv://<REDACTED>@<REDACTED>/webapp?retryWrites=true&w=majority'
+app.config['SECRET_KEY'] = os.environ['FLASK_SECRET_KEY']
+app.config['MONGO_URI'] = os.environ['MONGO_URI']
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 465
-app.config['MAIL_USERNAME'] = 'matin.amoozadeh2020@gmail.com' 
-app.config['MAIL_PASSWORD'] = '***REDACTED-GMAIL-APP-PASSWORD***' 
+app.config['MAIL_USERNAME'] = os.environ['MAIL_USERNAME']
+app.config['MAIL_PASSWORD'] = os.environ['MAIL_PASSWORD']
 app.config['MAIL_USE_TLS'] = False
 app.config['MAIL_USE_SSL'] = True
 
@@ -619,11 +620,9 @@ def programming_question(page_num):
                           code='',
                           page_num=page_num)
     
-# Load environment variables
-load_dotenv()
-
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 def format_test_results(test_results):
     """Helper to format test results as a readable string."""
@@ -698,7 +697,7 @@ def programming_prompt(page_num):
 
         # Send to ChatGPT with full history
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=OPENAI_MODEL,
             messages=messages,
             temperature=0.7
         )
@@ -1429,7 +1428,7 @@ def programming_prompt(page_num):
 
         # Call OpenAI
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=OPENAI_MODEL,
             messages=messages,
             temperature=0.7
         )

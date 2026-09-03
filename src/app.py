@@ -492,30 +492,6 @@ def detect_srl_phase_from_conversation(ai_response, user_prompt, code, terminal_
     
     return current_phase
 
-def detect_srl_phase_in_response(ai_response, user_prompt, code, terminal_output):
-    """Detect which SRL phase(s) the AI is currently addressing"""
-    ai_lower = ai_response.lower()
-    phases_detected = []
-    
-    forethought_keywords = ['plan', 'strategy', 'approach', 'goal', 'confident', 'before we', 'first step']
-    if any(keyword in ai_lower for keyword in forethought_keywords):
-        phases_detected.append('FORETHOUGHT')
-    
-    monitoring_keywords = ['how\'s it going', 'what\'s happening', 'run your code', 'output', 'expected', 'working', 'error']
-    if any(keyword in ai_lower for keyword in monitoring_keywords):
-        phases_detected.append('MONITORING')
-    
-    reflection_keywords = ['what did you learn', 'why did', 'what caused', 'what worked', 'looking back']
-    if any(keyword in ai_lower for keyword in reflection_keywords):
-        phases_detected.append('REFLECTION')
-    
-    if len(phases_detected) == 0:
-        return 'MONITORING'
-    elif len(phases_detected) == 1:
-        return phases_detected[0]
-    else:
-        return 'INTEGRATED'
-
 def format_test_results(test_results):
     """Helper to format test results as a readable string."""
     if not test_results:
@@ -2080,19 +2056,62 @@ def programming_submit_api(page_num):
         })
 
 
+def response_contains_code(text):
+    """Heuristic check: did the AI's reply leak actual code despite SRL_SYSTEM_CORE
+    telling it never to? The system prompt is not a hard guarantee -- this is the
+    server-side backstop, since for this study a silent violation isn't just a UX
+    problem, it's a validity problem (it changes what's actually being measured)."""
+    if not text:
+        return False
+    if '```' in text:
+        return True
+    cpp_signals = [r'#include\s*<', r'\bint\s+main\s*\(', r'\bstd::\w+', r'\bcout\s*<<', r'\bcin\s*>>']
+    if any(re.search(pat, text) for pat in cpp_signals):
+        return True
+    # A couple of semicolon-terminated lines is a strong code signal; one on its own
+    # is too common in ordinary prose to flag alone.
+    if len(re.findall(r';\s*$', text, re.MULTILINE)) >= 2:
+        return True
+    return False
+
+
 @api_bp.route('/programming/<page_num>/prompt', methods=['POST'])
 @jwt_required()
 def programming_prompt_api(page_num):
     """Natural SRL-based conversational AI - Always enabled"""
     current_user_id = get_jwt_identity()
-    
+
     data = request.get_json()
     prompt = data.get('prompt', '')
     code = data.get('code', '')
     terminal_output = data.get('terminal_output', '')
-    hide_user_prompt = data.get('hide_user_prompt', False)  
-    
+    hide_user_prompt = data.get('hide_user_prompt', False)
+
     try:
+        # Moderation check on the incoming prompt before it reaches the model or gets
+        # logged anywhere -- cheap (OpenAI's moderation endpoint is free) and this is
+        # about to be public, so anyone can reach it, not just enrolled students.
+        try:
+            moderation = client.moderations.create(input=prompt)
+            if moderation.results[0].flagged:
+                mongo.db.moderation_flags.insert_one({
+                    'user_id': current_user_id,
+                    'question_id': f'programming_q{page_num}',
+                    'prompt': prompt,
+                    'categories': [c for c, v in moderation.results[0].categories.model_dump().items() if v],
+                    'timestamp': datetime.datetime.utcnow()
+                })
+                return jsonify({
+                    'status': 'success',
+                    'ai_response': "Let's keep our conversation focused on the programming task -- what part of the problem can I help you think through?",
+                    'phase': 'PLANNING',
+                    'step_info': {'step_number': 0, 'total_steps': 3}
+                })
+        except Exception as mod_err:
+            # Don't let a moderation-API hiccup block a legitimate student -- log and
+            # continue to the real request instead of failing closed.
+            print(f"Moderation check failed (continuing without it): {mod_err}")
+
         question_id = f'programming_q{page_num}'
         question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
         question_text = question.get('question_text', '') if question else ''
@@ -2139,7 +2158,43 @@ def programming_prompt_api(page_num):
         )
         
         ai_response = response.choices[0].message.content
-        
+
+        # Server-side backstop for the "never write solution code" rule: the system
+        # prompt asks for this, but that's not a guarantee against an adversarial or
+        # just persistent user. One retry with a stricter reminder; if that also
+        # leaks code, fall back to a fixed refusal rather than show it.
+        guardrail_violation = response_contains_code(ai_response)
+        if guardrail_violation:
+            retry_messages = messages + [
+                {"role": "assistant", "content": ai_response},
+                {"role": "system", "content": (
+                    "Your previous reply included code, which breaks the ABSOLUTE RULES above. "
+                    "Rewrite it with no code at all -- no fenced blocks, no snippets, no syntax "
+                    "examples in this problem's language. Use a plain-language analogy instead."
+                )}
+            ]
+            retry_response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=retry_messages,
+                temperature=0.5,
+                max_tokens=600
+            )
+            retry_text = retry_response.choices[0].message.content
+            if response_contains_code(retry_text):
+                ai_response = (
+                    "I can't share code here -- my role is to coach your process, not write it "
+                    "for you. Let's break this down conceptually instead. What part are you stuck on?"
+                )
+            else:
+                ai_response = retry_text
+
+            mongo.db.guardrail_violations.insert_one({
+                'user_id': current_user_id,
+                'question_id': question_id,
+                'user_prompt': prompt,
+                'timestamp': datetime.datetime.utcnow()
+            })
+
         detected_phase = detect_srl_phase_from_conversation(
             ai_response, prompt, code, terminal_output, srl_state.get('phase', 'PLANNING')
         )

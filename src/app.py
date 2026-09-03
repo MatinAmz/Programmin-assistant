@@ -32,7 +32,13 @@ load_dotenv()
 
 app = Flask(__name__)
 
-CORS(app,resources={r"/api/*": {"origins": ["http://localhost:8080","https://understand-ai.org/","https://understand-ai.org/uh/"],"supports_credentials": True}})
+# Comma-separated list of allowed frontend origins, e.g.
+# "http://localhost:8080,https://your-frontend.onrender.com"
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get('ALLOWED_ORIGINS', 'http://localhost:8080').split(',') if o.strip()
+]
+
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS, "supports_credentials": True}})
 
 
 app.config['MONGO_DBNAME'] = 'webapp'
@@ -51,7 +57,7 @@ api_bp = Blueprint('api', __name__)
 jwt = JWTManager(app)
 
 csrf.exempt(api_bp)
-CORS(api_bp,resources={r"/api/*": {"origins": "http://localhost:8080","supports_credentials": True}})
+CORS(api_bp, resources={r"/api/*": {"origins": ALLOWED_ORIGINS, "supports_credentials": True}})
 
 
 
@@ -291,9 +297,9 @@ def presurvey():
                 'user_id': user_id,
                 'user_name': user_name,
                 'answers': answers,
-                'submitted_at': datetime.datetime.now(datetime.UTC)
+                'submitted_at': datetime.datetime.now(datetime.timezone.utc)
             }
-            
+
             print("Saving submission:", submission)
             mongo.db.preSurveyAnswers.insert_one(submission)
             
@@ -795,9 +801,9 @@ def programming_submit(page_num):
             'code': code,
             'test_results': test_results,
             'score': score,
-            'timestamp': datetime.datetime.now(datetime.UTC)
+            'timestamp': datetime.datetime.now(datetime.timezone.utc)
         }
-        
+
         # Save to MongoDB using upsert
         mongo.db.submissions.update_one(
             {
@@ -873,15 +879,15 @@ def postsurvey():
                 'user_id': user_id,
                 'user_name': user_name,
                 'answers': answers,
-                'submitted_at': datetime.datetime.now(datetime.UTC)
+                'submitted_at': datetime.datetime.now(datetime.timezone.utc)
             }
-            
+
             mongo.db.postSurveyAnswers.insert_one(submission)
             track_activity_end(current_user.id, 'postsurvey')
             # Update user status to indicate completion of the entire process
             mongo.db.users.update_one(
                 {'_id': ObjectId(user_id)},
-                {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.UTC)}}
+                {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.timezone.utc)}}
             )
             
             flash("Thank you for completing the survey! Your participation has been recorded.")
@@ -1215,9 +1221,9 @@ def api_presurvey():
         submission = {
             'user_id': current_user_id,
             'answers': data['answers'],
-            'submitted_at': datetime.datetime.now(datetime.UTC)
+            'submitted_at': datetime.datetime.now(datetime.timezone.utc)
         }
-        
+
         mongo.db.preSurveyAnswers.insert_one(submission)
         track_activity_end(current_user_id, 'presurvey')
         
@@ -1749,16 +1755,16 @@ def api_postsurvey():
             submission = {
                 'user_id': user_id,
                 'answers': answers,
-                'submitted_at': datetime.datetime.now(datetime.UTC)
+                'submitted_at': datetime.datetime.now(datetime.timezone.utc)
             }
-            
+
             mongo.db.postSurveyAnswers.insert_one(submission)
             track_activity_end(user_id, 'postsurvey')
-            
+
             # Update user status as complete
             mongo.db.users.update_one(
                 {'_id': ObjectId(user_id)},
-                {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.UTC)}}
+                {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.timezone.utc)}}
             )
             
             return jsonify({'status': 'success', 'message': 'Survey submitted successfully'})

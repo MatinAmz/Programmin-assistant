@@ -17,11 +17,11 @@
               <v-form v-model="valid" @submit.prevent="submitSurvey" ref="surveyForm">
                 <!-- Render non-likert questions -->
                 <div
-                  v-for="(question, index) in nonLikertQuestions"
-                  :key="index"
+                  v-for="(question) in nonLikertQuestions"
+                  :key="question.index"
                   class="question-divider"
                 >
-                  <!-- Multiple Choice (Radio - old format) -->
+                  <!-- Multiple Choice (Radio - old format: options are strings) -->
                   <v-radio-group
                     v-if="question.question_type === 'multiple_choice'"
                     v-model="answers[question.index]"
@@ -32,11 +32,11 @@
                     <v-radio
                       v-for="(option, optIndex) in question.options"
                       :key="optIndex"
-                      :label="option"
-                      :value="option"
+                      :label="getOptionLabel(option)"
+                      :value="getOptionValue(option)"
                     ></v-radio>
                   </v-radio-group>
- 
+
                   <!-- Text Input -->
                   <v-text-field
                     v-if="question.question_type === 'text_input' || question.question_type === 'text'"
@@ -49,7 +49,7 @@
                     :error="submittedOnce && question.required && (answers[question.index] === '' || answers[question.index] === null)"
                     :type="question.unit === 'years' ? 'number' : 'text'"
                   ></v-text-field>
- 
+
                   <!-- Checkbox Group -->
                   <div
                     v-if="question.question_type === 'checkbox'"
@@ -60,15 +60,15 @@
                     <v-checkbox
                       v-for="(option, optIndex) in question.options"
                       :key="optIndex"
-                      :label="option.label"
-                      :value="option.value"
+                      :label="getOptionLabel(option)"
+                      :value="getOptionValue(option)"
                       v-model="answers[question.index]"
                       color="primary"
                       hide-details="true"
                     ></v-checkbox>
                   </div>
- 
-                  <!-- Radio Group (object format) -->
+
+                  <!-- Radio Group (object or string format supported) -->
                   <v-radio-group
                     v-if="question.question_type === 'radio'"
                     v-model="answers[question.index]"
@@ -79,17 +79,17 @@
                     <v-radio
                       v-for="(option, optIndex) in question.options"
                       :key="optIndex"
-                      :label="option.label"
-                      :value="option.value"
+                      :label="getOptionLabel(option)"
+                      :value="getOptionValue(option)"
                     ></v-radio>
                   </v-radio-group>
- 
+
                   <!-- Fallback for unknown question types -->
                   <div v-if="!['text_input', 'text', 'multiple_choice', 'checkbox', 'radio', 'likert_scale'].includes(question.question_type)" class="mb-4">
                     <p class="question-text"><strong>Unsupported question type:</strong> {{ question.question_type }}</p>
                   </div>
                 </div>
- 
+
                 <!-- Likert Questions -->
                 <div v-if="likertQuestions.length" class="question-divider">
                   <h2 class="text-h6 mb-4">Please select your answer for each statement:</h2>
@@ -104,35 +104,36 @@
                               :key="idx"
                               class="table-cell text-center"
                             >
-                              {{ option }}
+                              {{ getOptionLabel(option) }}
                             </th>
                           </tr>
                         </thead>
                         <tbody>
                           <tr
-                            v-for="item in likertQuestions"
-                            :key="item.index"
+                            v-for="q in likertQuestions"
+                            :key="q.index"
                             class="table-row"
                           >
                             <td class="table-cell">
-                              {{ item.question.question_text }}
+                              {{ q.question_text }}
                             </td>
                             <td
-                              v-for="(option, optIndex) in item.question.options"
+                              v-for="(option, optIndex) in likertOptions"
                               :key="optIndex"
                               class="table-cell text-center"
                             >
-                              <!-- Here each Likert radio group gets marked red if no option is selected -->
+                              <!-- Each cell holds one radio; all share the same v-model for the row -->
                               <v-radio-group
-                                v-model="answers[item.index]"
+                                v-model="answers[q.index]"
                                 row
                                 hide-details="true"
-                                :error="submittedOnce && item.question.required && !answers[item.index]"
+                                :error="submittedOnce && q.required && !answers[q.index]"
                                 class="d-flex justify-center"
                               >
                                 <v-radio
-                                  :value="option"
+                                  :value="getOptionValue(option)"
                                   class="d-flex justify-center"
+                                  :label="''"
                                 ></v-radio>
                               </v-radio-group>
                             </td>
@@ -142,26 +143,26 @@
                     </v-simple-table>
                   </div>
                 </div>
- 
+
                 <!-- Modified Submit Button (always clickable) -->
-                  <div class="d-flex justify-center">
-                    <v-btn
-                      type="button"
-                      color="blue"
-                      class="mb-4 text-subtitle-1 px-5"
-                      :loading="loading"
-                      @click="handleSubmit"
-                    >
-                      Submit Survey
-                    </v-btn>
-                  </div>
+                <div class="d-flex justify-center">
+                  <v-btn
+                    type="button"
+                    color="blue"
+                    class="mb-4 text-subtitle-1 px-5"
+                    :loading="loading"
+                    @click="handleSubmit"
+                  >
+                    Submit Survey
+                  </v-btn>
+                </div>
               </v-form>
             </v-card>
           </div>
         </v-col>
       </v-row>
     </v-container>
- 
+
     <!-- Snackbar -->
     <v-snackbar
       v-model="showOverlayAlert"
@@ -175,10 +176,10 @@
     </v-snackbar>
   </v-main>
 </template>
- 
+
 <script>
 import api from '../axios';
- 
+
 export default {
   name: 'PreSurvey',
   data() {
@@ -199,26 +200,23 @@ export default {
     };
   },
   computed: {
+    // Use the questions exactly as provided; don't overwrite their .index
     nonLikertQuestions() {
-      return this.questions
-        .map((question, index) => ({ ...question, index }))
-        .filter(item => item.question_type !== 'likert_scale');
+      return this.questions.filter(q => q.question_type !== 'likert_scale');
     },
     likertQuestions() {
-      return this.questions
-        .map((question, index) => ({ question, index }))
-        .filter(item => item.question.question_type === 'likert_scale');
+      return this.questions.filter(q => q.question_type === 'likert_scale');
     },
     likertOptions() {
       return this.likertQuestions.length
-        ? this.likertQuestions[0].question.options
+        ? this.likertQuestions[0].options
         : [];
     },
-    // Check that every required question is answered.
+    // Check that every required question is answered using the server-provided index.
     allRequiredAnswered() {
-      return this.questions.every((question, index) => {
+      return this.questions.every((question) => {
         if (!question.required) return true;
-        const answer = this.answers[index];
+        const answer = this.answers[question.index];
         if (question.question_type === 'checkbox') {
           return Array.isArray(answer) && answer.length > 0;
         }
@@ -244,6 +242,13 @@ export default {
       if (parts.length === 2) return parts.pop().split(';').shift();
       return null;
     },
+    // Normalize option for labels/values (supports strings or {label, value})
+    getOptionLabel(option) {
+      return typeof option === 'string' ? option : option?.label ?? '';
+    },
+    getOptionValue(option) {
+      return typeof option === 'string' ? option : option?.value ?? option?.label ?? '';
+    },
     async fetchQuestions() {
       try {
         const token = this.getAccessToken();
@@ -251,12 +256,12 @@ export default {
           headers: { Authorization: `Bearer ${token}` },
         });
         this.questions = response.data.questions;
-        // Initialize answers for each question
-        this.questions.forEach((question, index) => {
+        // Initialize answers using the server-provided question.index
+        this.questions.forEach((question) => {
           if (question.question_type === 'checkbox') {
-            this.answers[index] = [];
+            this.answers[question.index] = [];
           } else {
-            this.answers[index] = '';
+            this.answers[question.index] = '';
           }
         });
       } catch (error) {
@@ -269,8 +274,8 @@ export default {
     handleSubmit() {
       // Set the flag to show errors on fields that are empty
       this.submittedOnce = true;
-      // Optionally, you could trigger form validation (if needed):
-      this.$refs.surveyForm.validate();
+      // Optionally, trigger form validation (if needed):
+      this.$refs.surveyForm?.validate?.();
       // If any required field is not answered, show the snackbar and exit.
       if (!this.allRequiredAnswered || !this.valid) {
         this.showOverlayAlert = true;
@@ -282,13 +287,14 @@ export default {
     async submitSurvey() {
       this.loading = true;
       try {
-        const formattedAnswers = this.questions.map((question, index) => {
-          let answerValue = this.answers[index];
+        const formattedAnswers = this.questions.map((question) => {
+          let answerValue = this.answers[question.index];
           if (Array.isArray(answerValue)) {
             answerValue = answerValue.join(', ');
           }
           return {
-            questionId: index,
+            // Preserve the server's index as the id
+            questionId: question.index,
             questionText: question.question_text,
             answer: answerValue,
           };
@@ -314,7 +320,7 @@ export default {
   },
 };
 </script>
- 
+
 <style scoped>
 .login-background {
   background-color: #dee2e6;
@@ -330,36 +336,36 @@ export default {
   border-bottom: 1px solid grey;
   font-size: 16px;
 }
- 
+
 /* Ensure question text in checkbox groups has the same font size */
 .question-text {
   font-size: 16px;
   margin-bottom: 8px;
 }
- 
+
 /* Likert table adjustments for uniform padding and font sizes */
 .likert-table .table-cell {
   border: 1px solid #dedede;
   padding: 8px 8px 8px 20px;
   font-size: 16px;
 }
- 
+
 .likert-table th.table-cell {
   background-color: #f5f5f5;
 }
- 
+
 .likert-table .table-row {
   border: 1px solid #f5f5f5;
 }
- 
+
 .rounded-card {
   border-radius: 12px;
 }
- 
+
 .scrollable-table {
   overflow-x: auto;
 }
- 
+
 /* Custom style for groups (like checkbox container) in error.
    You can adjust the border style and color as needed. */
 .input-error {

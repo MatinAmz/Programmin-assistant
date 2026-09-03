@@ -2,30 +2,45 @@ from flask import Flask, Blueprint, render_template, request, redirect, url_for,
 import random
 from flask_pymongo import PyMongo
 from flask_login import LoginManager, UserMixin, current_user, login_user, logout_user, login_required
-from itsdangerous import SignatureExpired
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired
 from form import LoginForm, RegistrationForm, ForgotPasswordForm
 from bson.objectid import ObjectId
 from flask_mail import Mail, Message
 import string
-import math
-from itsdangerous import URLSafeTimedSerializer, SignatureExpired
 import bcrypt
-from functools import wraps
 import subprocess
 import tempfile
 import os
 import traceback
 import sys
 import datetime
-import pytz  # Added for proper timezone handling
+import pytz
 from openai import OpenAI
-import os
 from dotenv import load_dotenv
 from flask_wtf.csrf import CSRFProtect
 from flask_cors import CORS
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from flask_jwt_extended import JWTManager
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, JWTManager
 import io
+import shutil
+import platform
+import threading
+import json
+import re
+
+try:
+    import resource
+except Exception:
+    resource = None
+
+try:
+    from dns import resolver 
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+    print("Warning: dnspython not installed. Email domain validation will be limited.")
+
+EXEC_SEMAPHORE = threading.BoundedSemaphore(value=2)
+
 
 # Load environment variables from src/.env before anything reads them.
 load_dotenv()
@@ -38,8 +53,12 @@ ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get('ALLOWED_ORIGINS', 'http://localhost:8080').split(',') if o.strip()
 ]
 
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS, "supports_credentials": True}})
-
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ALLOWED_ORIGINS,
+        "supports_credentials": True
+    }
+})
 
 app.config['MONGO_DBNAME'] = 'webapp'
 app.config['SECRET_KEY'] = os.environ['FLASK_SECRET_KEY']
@@ -51,272 +70,782 @@ app.config['MAIL_PASSWORD'] = os.environ['MAIL_PASSWORD']
 app.config['MAIL_USE_TLS'] = False
 app.config['MAIL_USE_SSL'] = True
 
-csrf = CSRFProtect(app) 
 
+csrf = CSRFProtect(app)
 api_bp = Blueprint('api', __name__)
 jwt = JWTManager(app)
-
 csrf.exempt(api_bp)
-CORS(api_bp, resources={r"/api/*": {"origins": ALLOWED_ORIGINS, "supports_credentials": True}})
-
-
-
 mail = Mail(app)
-# Setup for token generation for password reset
 s = URLSafeTimedSerializer(app.config['SECRET_KEY'])
-
 mongo = PyMongo(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 
+load_dotenv()
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+# ============= Helper Functions =============
+def _limit_child_resources():
+    """Limit resources for child processes"""
+    if resource is None:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+        mem = 512 * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
+    except Exception:
+        pass
+
+# ============= Initialize Collections =============
 def initialize_conversations_collection():
     with app.app_context():
         if 'conversations' not in mongo.db.list_collection_names():
             mongo.db.create_collection('conversations')
-            # Indexes for fast queries
             mongo.db.conversations.create_index([('user_id', 1), ('question_id', 1)], unique=True)
 
+def initialize_srl_collections():
+    """Initialize SRL-related MongoDB collections"""
+    with app.app_context():
+        if 'srl_conversation_states' not in mongo.db.list_collection_names():
+            mongo.db.create_collection('srl_conversation_states')
+            mongo.db.srl_conversation_states.create_index([('user_id', 1), ('question_id', 1)], unique=True)
+        if 'user_feedback' not in mongo.db.list_collection_names():
+            mongo.db.create_collection('user_feedback')
+            mongo.db.user_feedback.create_index([('user_id', 1), ('question_id', 1), ('timestamp', -1)])
+
 initialize_conversations_collection()
+initialize_srl_collections()
+# ========== SRL PROMPT CONSTANTS ==========
+
+SRL_SYSTEM_CORE = """
+You are an SRL (Self-Regulated Learning) coding coach for C++ students.
+Your job is to guide through Planning → Monitoring → Reflection without giving solutions.
+NEVER write solution code for users.
+Keep replies ≤ 200 words unless the user explicitly asks for more.
+End every reply with 1–2 short questions prompting next action.
+
+ABSOLUTE RULES
+- Do NOT output any code in any language (no fenced blocks, no snippets, no signatures).
+- Use non-code analogies from other domains (bookstore, library, restaurant) to illustrate concepts; never use assignment-specific names (do not use BankAccount or similar).
+- If the user asks for “syntax”, provide a boilerplate pattern with placeholders.
+- Explain patterns conceptually: "Think of it like organizing a filing cabinet..."
+- Prefer questions over answers; keep replies ~200 words unless asked for more.
+- End every reply with 1–2 short questions that prompt the next action.
+
+MESSAGE SHAPE
+1) A bold phase header (one of: **Planning**, **Monitoring**, **Reflection**)
+2) 3–5 bullets tailored to THIS problem using conceptual guidance
+3) 1–2 short questions prompting the next action
+"""
+
+
+PLANNING_HINT = """
+**Planning**
+- Break THIS problem into 3–4 concrete steps tied to its exact requirements.
+- Identify what data (state) and what actions (methods) are needed.
+- Offer a boilerplate pattern ONLY if the student asks about syntax; avoid any compilable code.
+- Do NOT provide any assignment code.
+End with: Which step would you like to start with, and what will you try first?
+"""
+
+MONITORING_HINT = """
+**Monitoring**
+- Compare expected vs. actual behavior; ask where state changes.
+- Suggest 1–2 micro-experiments (describe what to observe, not code to paste).
+- Keep any syntax help as a plain-text pattern, never full assignment logic.
+
+End with: What did you observe after the micro-experiment, and where did the behavior diverge from expectations?
+"""
+REFLECTION_HINT = """
+**Reflection**
+- Celebrate briefly, then propose one small improvement (naming, guard conditions, repetition removal, complexity).
+- Keep suggestions incremental and safe; no big redesigns unless asked.
+- Do not rewrite their code; describe the improvement and why.
+
+End with: What part was most challenging, and what strategy would you reuse next time?
+"""
+
+
+REAL_WORLD_ANALOGIES = {
+    "class_structure": """
+Think of a class like a **BLUEPRINT FOR A HOUSE**:
+- Private members = rooms you can't see from outside (bedroom, bathroom)
+- Public methods = doors and windows that let people interact with the house
+- Constructor = the building process that sets up the house initially
+The blueprint defines what every house of this type will have, but each actual house (object) has its own specific values.
+""",
+    
+    "encapsulation": """
+Think of encapsulation like a **VENDING MACHINE**:
+- You can't reach inside and grab items directly (private data)
+- You use buttons to interact with it (public methods)
+- The machine controls what you can do (enforces rules)
+This protects the internal state and ensures everything happens correctly.
+""",
+    
+    "constructor": """
+Think of a constructor like **SETTING UP A NEW PHONE**:
+- When you first get it, you enter your name, language, time zone
+- These initial settings make the phone ready to use
+- Without setup, the phone wouldn't work properly
+A constructor does the same thing - it sets up initial values so the object is ready to use.
+""",
+    
+    "guard_conditions": """
+Think of guard conditions like a **BOUNCER AT A CLUB**:
+- The bouncer checks: Are you old enough? Do you have ID?
+- If requirements aren't met, you don't get in
+- This prevents problems before they happen
+Your code does the same - it checks "Is this input valid?" before proceeding.
+""",
+    
+    "state_management": """
+Think of managing state like **KEEPING TRACK OF YOUR BANK ACCOUNT**:
+- You need to know your current balance (state)
+- Every deposit or withdrawal changes that balance
+- You can't withdraw more than you have (rule enforcement)
+Your code tracks values and updates them based on what happens.
+""",
+    
+    "method_design": """
+Think of methods like **APPLIANCE BUTTONS**:
+- A microwave has buttons: Start, Stop, Add Time
+- Each button does ONE specific thing
+- You don't need to know HOW the microwave works internally
+Methods are the same - each does one clear job, and users don't need to know the implementation details.
+""",
+    
+    "testing": """
+Think of testing like **TASTE-TESTING A RECIPE**:
+- You try a small sample to see if it's right
+- If it's too salty, you adjust before serving the whole meal
+- You check different aspects: taste, texture, temperature
+Testing code is similar - try small pieces, check the results, fix problems early.
+"""
+}
+
+REFUSAL_TEMPLATE = """
+REFUSAL & REDIRECT
+If asked for the complete solution: 
+"I can't provide the full solution—my role is to coach your process. Think of it this way: if I gave you the answer, you wouldn't build the problem-solving skills you need for the next challenge. Let me guide you through the thinking process instead. Which part are you stuck on?"
+
+If asked for code examples:
+"I can’t share code, but here’s the concept: {ANALOGY}. How would YOU translate that idea into your own code for this task? What’s your first step?"
+
+If they're completely stuck:
+"Let's break this down into smaller pieces. Imagine you're explaining to a friend how {REAL_WORLD_ANALOGY}. What would be the first step? That's exactly what your code needs to do."
+"""
+
+
+
+# ========== MAIN PROMPT BUILDER(system message) ==========
+
+def build_natural_srl_prompt(question_text, code, terminal_output, conversation_history, current_step_info):
+    # ------ Lightweight context shaping ------
+    def _brief(txt, limit):
+        if not txt:
+            return "None"
+        txt = txt.strip()
+        return (txt[:limit] + "…") if len(txt) > limit else txt
+    
+    code_brief = _brief(code, 1200)
+    out_brief = _brief(terminal_output, 1000)
+    is_first_message = len(conversation_history) == 0
+    has_minimal_code = not code or len(code.strip()) < 50
+    has_output = bool(terminal_output and terminal_output.strip())
+    all_tests_passed = ('passed' in terminal_output.lower() and 
+                       'failed' not in terminal_output.lower()) if has_output else False
+    
+    # ------ Syntax error detection ------
+    syntax_keywords = ['syntax error', 'expected', 'undeclared', 'parse error', 
+                       'missing', 'unexpected', 'invalid syntax', 'error:', 'undefined']
+    has_syntax_error = any(keyword in terminal_output.lower() 
+                          for keyword in syntax_keywords) if has_output else False
+    
+    # ------ Phase determination and analogy selection ------
+    if is_first_message or has_minimal_code:
+        phase = "PLANNING"
+        phase_instruction = PLANNING_HINT
+        suggested_analogies = [
+            REAL_WORLD_ANALOGIES["class_structure"],
+            REAL_WORLD_ANALOGIES["constructor"]
+        ]
+    elif all_tests_passed:
+        phase = "REFLECTION"
+        phase_instruction = REFLECTION_HINT
+        suggested_analogies = [
+            REAL_WORLD_ANALOGIES["encapsulation"],
+            REAL_WORLD_ANALOGIES["testing"]
+        ]
+    else:
+        phase = "DEBUGGING"
+        if has_syntax_error:
+            # Enhanced debugging for syntax issues
+            phase_instruction = """
+**Debugging → Syntax Issue Detected**
+- Identify the TYPE of syntax issue (e.g., "missing piece in the structure", "incorrect order of elements") using conceptual language.
+- Use an analogy: "It's like trying to assemble furniture but missing a screw - the structure isn't complete."
+- Ask: "Look at the error message carefully. What piece is it expecting that's not there?"
+
+
+End with: What did you change, and what happened when you compiled again?
+"""
+            suggested_analogies = [
+                REAL_WORLD_ANALOGIES["constructor"],
+                REAL_WORLD_ANALOGIES["class_structure"]
+            ]
+        else:
+            phase_instruction = MONITORING_HINT
+            suggested_analogies = [
+                REAL_WORLD_ANALOGIES["guard_conditions"],
+                REAL_WORLD_ANALOGIES["state_management"]
+            ]
+    
+    # ------ Extract class names from question to prevent them in discussion ------
+    forbidden_terms = []
+    import re
+    class_matches = re.findall(r'\b([A-Z][a-zA-Z]+)\b', question_text)
+    forbidden_terms.extend(class_matches[:5])
+    
+    forbidden_list = ", ".join(forbidden_terms) if forbidden_terms else "assignment-specific names"
+    
+    # ------ Build analogies section ------
+    analogies_section = ""
+    if suggested_analogies:
+        analogies_section = "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        analogies_section += "REAL-WORLD ANALOGIES (use if helpful for conceptual clarity):\n"
+        analogies_section += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        analogies_section += "\n".join(suggested_analogies)
+    
+    # ------ Compose final system message ------
+    return f"""
+{SRL_SYSTEM_CORE}
+
+═══════════════════════════════════════════════════════════════
+TASK CONTEXT
+═══════════════════════════════════════════════════════════════
+Problem Statement:
+{question_text}
+
+═══════════════════════════════════════════════════════════════
+STUDENT CONTEXT
+═══════════════════════════════════════════════════════════════
+Current Code (trimmed):
+{code_brief}
+
+Latest Output/Tests (trimmed):
+{out_brief}
+
+Step Info: {current_step_info}
+Syntax Error Detected: {has_syntax_error}
+Phase: {phase}
+
+═══════════════════════════════════════════════════════════════
+PHASE BEHAVIOR
+═══════════════════════════════════════════════════════════════
+{phase_instruction}
+
+═══════════════════════════════════════════════════════════════
+CRITICAL INSTRUCTION: CODE EXAMPLES FROM OTHER DOMAINS
+═══════════════════════════════════════════════════════════════
+- Do show code examples from different domains to illustrate concepts
+- Guide with questions, not code snippets
+- Help them understand the PATTERN, not copy a different implementation
+
+Forbidden Assignment Terms (never discuss these directly): {forbidden_list}
+
+{REFUSAL_TEMPLATE}
+{analogies_section}
+
+═══════════════════════════════════════════════════════════════
+NOW RESPOND
+═══════════════════════════════════════════════════════════════
+Produce your response following MESSAGE SHAPE above.
+Be warm, use analogies to explain concepts, and end with 1-2 questions that prompt action.
+Keep response under 200 words unless more detail is explicitly requested.
+Do NOT output any code in any language (no fenced blocks, no snippets, no signatures).
+"""
+
+
+if __name__ == "__main__":
+    # Example usage
+    question = """
+    Create a BankAccount class with:
+    - Private members: customerName, checkingBalance, savingsBalance
+    - Constructor to initialize all values
+    - Getter/setter methods for all members
+    - Methods: DepositChecking, WithdrawSavings, TransferToSavings
+    """
+    
+    code = """
+    class BankAccount {
+    public:
+        BankAccount(string name, double checking, double savings)
+    """
+    
+    output = "error: expected '{' after constructor declaration"
+    
+    prompt = build_natural_srl_prompt(
+        question_text=question,
+        code=code,
+        terminal_output=output,
+        conversation_history=[],
+        current_step_info={'step_number': 1, 'total_steps': 4}
+    )
+    
+    print(prompt)
+    print("\n" + "="*70)
+    print("EXPECTED AI RESPONSE STYLE:")
+    print("="*70)
+    print("""
+**Debugging → Syntax Issue Detected**
+
+I can see the compiler is expecting something after your constructor parameters. 
+
+Think of it like this: When you write instructions for assembling furniture, you need:
+1. The list of parts (your parameters)
+2. The actual assembly steps (the constructor body)
+
+Your code has the parts list but is missing the body where the assembly happens. The body should show HOW to use those parameters to set up your object.
+
+What element comes after the parameter list to contain the initialization logic?
+What did you change, and what happened when you compiled again?
+""")
+
+
+
+class SRLConversationManager:
+    """Manages SRL conversation state for users"""
+    
+    @staticmethod
+    def get_or_create_state(user_id, question_id):
+        """Get existing SRL state or create a new one"""
+        state = mongo.db.srl_conversation_states.find_one({
+            'user_id': user_id,
+            'question_id': question_id
+        })
+        
+        if not state:
+            # Create initial state
+            state = {
+                'user_id': user_id,
+                'question_id': question_id,
+                'phase': 'PLANNING',
+                'step_number': 0,
+                'total_steps': 4,
+                'current_step_name': 'Getting Started',
+                'interaction_count': 0,
+                'confidence_ratings': [],
+                'created_at': datetime.datetime.utcnow(),
+                'last_updated': datetime.datetime.utcnow()
+            }
+            mongo.db.srl_conversation_states.insert_one(state)
+        
+        return state
+    
+    @staticmethod
+    def update_state(user_id, question_id, updates):
+        """Update SRL state with new information"""
+        updates['last_updated'] = datetime.datetime.utcnow()
+        
+        mongo.db.srl_conversation_states.update_one(
+            {'user_id': user_id, 'question_id': question_id},
+            {'$set': updates},
+            upsert=True
+        )
+    
+    @staticmethod
+    def get_phase_summary(user_id, question_id):
+        """Get summary of user's SRL phases"""
+        state = mongo.db.srl_conversation_states.find_one({
+            'user_id': user_id,
+            'question_id': question_id
+        })
+        
+        if not state:
+            return None
+        
+        return {
+            'current_phase': state.get('phase', 'PLANNING'),
+            'step_progress': f"{state.get('step_number', 0)}/{state.get('total_steps', 4)}",
+            'interaction_count': state.get('interaction_count', 0),
+            'average_confidence': sum(r['rating'] for r in state.get('confidence_ratings', [])) / len(state.get('confidence_ratings', [])) if state.get('confidence_ratings') else None
+        }
+
+def detect_srl_phase_from_conversation(ai_response, user_prompt, code, terminal_output, current_phase):
+    """Detect which SRL phase based on conversation"""
+    ai_lower = ai_response.lower()
+    user_lower = user_prompt.lower() if user_prompt else ""
+    
+    if any(phrase in ai_lower for phrase in ['step 1:', 'step 2:', "i've broken", 'break it down']):
+        return 'PLANNING'
+    
+    if terminal_output or len(code) > 100:
+        if any(phrase in ai_lower for phrase in ['try', 'implement', 'run your code', 'check your']):
+            return 'MONITORING'
+    
+    if any(phrase in ai_lower for phrase in ['you solved it', 'awesome work', 'completed']):
+        return 'REFLECTION'
+    
+    return current_phase
+
+def detect_srl_phase_in_response(ai_response, user_prompt, code, terminal_output):
+    """Detect which SRL phase(s) the AI is currently addressing"""
+    ai_lower = ai_response.lower()
+    phases_detected = []
+    
+    forethought_keywords = ['plan', 'strategy', 'approach', 'goal', 'confident', 'before we', 'first step']
+    if any(keyword in ai_lower for keyword in forethought_keywords):
+        phases_detected.append('FORETHOUGHT')
+    
+    monitoring_keywords = ['how\'s it going', 'what\'s happening', 'run your code', 'output', 'expected', 'working', 'error']
+    if any(keyword in ai_lower for keyword in monitoring_keywords):
+        phases_detected.append('MONITORING')
+    
+    reflection_keywords = ['what did you learn', 'why did', 'what caused', 'what worked', 'looking back']
+    if any(keyword in ai_lower for keyword in reflection_keywords):
+        phases_detected.append('REFLECTION')
+    
+    if len(phases_detected) == 0:
+        return 'MONITORING'
+    elif len(phases_detected) == 1:
+        return phases_detected[0]
+    else:
+        return 'INTEGRATED'
+
+def format_test_results(test_results):
+    """Helper to format test results as a readable string."""
+    if not test_results:
+        return "No test results available."
+    formatted = ""
+    for result in test_results:
+        formatted += f"Test: {result.get('test_name', 'Unknown')}\n"
+        formatted += f"Status: {result.get('status', 'Unknown')}\n"
+        formatted += f"Input: {result.get('input', '')}\n"
+        formatted += f"Expected: {result.get('expected', '')}\n"
+        formatted += f"Actual: {result.get('actual', '')}\n"
+        if 'error' in result:
+            formatted += f"Error: {result['error']}\n"
+        formatted += "\n"
+    return formatted
 
 def track_activity_start(user_id, activity):
     """Record when a user starts an activity"""
-    current_time = datetime.datetime.utcnow()
-    
-    # Check if there's an existing unfinished activity record
-    existing = mongo.db.user_activities.find_one({
+    mongo.db.user_activities.insert_one({
         'user_id': user_id,
         'activity': activity,
-        'end_time': None  # Unfinished activity
+        'start_time': datetime.datetime.utcnow(),
+        'end_time': None
     })
-    
-    if existing:
-        # Update existing record if it exists but wasn't properly closed
-        mongo.db.user_activities.update_one(
-            {'_id': existing['_id']},
-            {'$set': {'start_time': current_time}}
-        )
-    else:
-        # Create new activity record
-        mongo.db.user_activities.insert_one({
-            'user_id': user_id,
-            'activity': activity,
-            'start_time': current_time,
-            'end_time': None
-        })
+
 
 def track_activity_end(user_id, activity):
-    """Record when a user finishes an activity"""
+    """Record when a user finishes an activity and calculate duration"""
     current_time = datetime.datetime.utcnow()
     
-    # Find the most recent unfinished activity for this user and activity
+    # Find the most recent activity record
     activity_record = mongo.db.user_activities.find_one(
-        {
-            'user_id': user_id,
-            'activity': activity,
-            'end_time': None  # Unfinished activity
-        },
-        sort=[('start_time', -1)]  # Get the most recent
+        {'user_id': user_id, 'activity': activity, 'end_time': None},
+        sort=[('start_time', -1)]
     )
     
     if activity_record:
-        # Calculate duration
-        start_time = activity_record['start_time']
-        duration_seconds = (current_time - start_time).total_seconds()
-        duration_minutes = duration_seconds / 60
+        # Calculate duration in seconds and minutes
+        duration_seconds = (current_time - activity_record['start_time']).total_seconds()
+        duration_minutes = round(duration_seconds / 60, 2)
         
-        # Update the record with end time and duration
+        # Update with end time and duration
         mongo.db.user_activities.update_one(
             {'_id': activity_record['_id']},
-            {
-                '$set': {
-                    'end_time': current_time,
-                    'duration_seconds': duration_seconds,
-                    'duration_minutes': duration_minutes
-                }
-            }
+            {'$set': {
+                'end_time': current_time,
+                'duration_seconds': duration_seconds,
+                'duration_minutes': duration_minutes
+            }}
         )
 
-
-
-
-# Create users collection
-with app.app_context():
-   if 'users' not in mongo.db.list_collection_names():
-       mongo.db.create_collection('users')
-
-class User(UserMixin):
-   def __init__(self, user_data):
-       self.id = str(user_data['_id'])
-       self.name = user_data['name']
-       self.email = user_data['email']
-       self.research_group = user_data.get('research_group', 'experiment')  # Updated default
-
-
-@login_manager.user_loader
-def load_user(user_id):
-   user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
-   return User(user_data) if user_data else None
-
-
-@app.route('/', methods=['GET', 'POST'])
-def register():
-    form = RegistrationForm()
-    if form.validate_on_submit():
-        # Check if email already exists
-        existing_user = mongo.db.users.find_one({'email': form.email.data})
-        if existing_user:
-            flash('Email already exists. Please login.')
-            return redirect(url_for('login'))
-        
-        # Hash the password before storing it
-        hashed_password = bcrypt.hashpw(form.password.data.encode('utf-8'), bcrypt.gensalt())
-        
-        # Save the user to the database
-        user = {
-            'name': form.name.data,
-            'email': form.email.data,
-            'password': hashed_password.decode('utf-8')  # Decode to save as string
-        }
-        result = mongo.db.users.insert_one(user)
-        
-        # NEW: Assign research group randomly during registration
-        inserted_id = result.inserted_id
-        group = random.choice(['experiment', 'control'])
-        mongo.db.users.update_one(
-            {'_id': inserted_id},
-            {'$set': {'research_group': group}}
-        )
-        # Log the assignment (optional, for auditing)
-        mongo.db.user_activities.insert_one({
-            'user_id': str(inserted_id),
-            'activity': 'group_assignment',
-            'group': group,
-            'timestamp': datetime.datetime.utcnow()
-        })
-        
-        flash('Registration successful!')
-        return redirect(url_for('login'))
+def is_valid_email(email):
+    """Validate email format and check if domain exists"""
+    # Basic format check
+    email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_regex, email):
+        return False, "Invalid email format"
     
-    return render_template('auth/register.html', title='Register', form=form)
-
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    form = LoginForm()
-    if form.validate_on_submit():
-        user_data = mongo.db.users.find_one({'email': form.email.data})
-        if user_data and bcrypt.checkpw(form.password.data.encode('utf-8'), user_data['password'].encode('utf-8')):
-            # Check if group is assigned; if not, randomize
-            if 'research_group' not in user_data or not user_data['research_group']:
-                group = random.choice(['experiment', 'control'])
-                mongo.db.users.update_one(
-                    {'_id': user_data['_id']},
-                    {'$set': {'research_group': group}}
-                )
-                # Log the assignment (optional, for auditing)
-                mongo.db.user_activities.insert_one({
-                    'user_id': str(user_data['_id']),
-                    'activity': 'group_assignment',
-                    'group': group,
-                    'timestamp': datetime.datetime.utcnow()
-                })
-            user_obj = User(user_data)
-            login_user(user_obj)
-            return redirect(url_for('presurvey'))
-        flash('Invalid email or password')
-    return render_template('auth/login.html', title='Login', form=form)
-
-
-@app.route('/forgot-password', methods=['GET', 'POST'])
-def forgot_password():
-    form = ForgotPasswordForm()
-    if form.validate_on_submit():
-        email = form.email.data
-        user = mongo.db.users.find_one({'email': email})
-
-        if user:
-            # Generate a random password
-            new_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))  # Length of 10
-
-            # Hash the new password before storing it
-            hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
-
-            # Update the user's password in the database
-            mongo.db.users.update_one({'email': email}, {'$set': {'password': hashed_password.decode('utf-8')}})
-
-            # Send the new password to the user's email
-            subject = "Your New Password"
-            msg = Message(subject, sender=app.config['MAIL_USERNAME'], recipients=[email])
-            msg.body = f"Your new password is: {new_password}\nYou can now log in with this password."
-            mail.send(msg)
-
-            flash('A new password has been sent to your email. Please log in with the new password.', 'info')
-            return redirect(url_for('login'))
-        else:
-            flash('Email not found.', 'danger')
-
-    return render_template('auth/forgot_password.html', title='Forgot Password', form=form)
-
-@app.route('/preSurvey', methods=['GET', 'POST'])
-@login_required
-def presurvey():
-    if request.method == 'GET':
-        track_activity_start(current_user.id, 'presurvey')
-        questions = list(mongo.db.preSurveyQuestion.find())
-        return render_template('surveys/preSurvey.html', questions=questions)
-
-    elif request.method == 'POST':
+    # Check for common fake/temporary email domains
+    fake_domains = [
+        'test.com', 'example.com', 'fake.com', 'dummy.com', 
+        'temp.com', 'temporary.com', 'throwaway.com', 'tempmail.com',
+        'mailinator.com', '10minutemail.com', 'guerrillamail.com',
+        'trashmail.com', 'yopmail.com', 'maildrop.cc', 'getnada.com',
+        'fakeinbox.com', 'throwawaymail.com', 'spam4.me', 'tempmail.org'
+    ]
+    
+    domain = email.split('@')[1].lower()
+    if domain in fake_domains:
+        return False, "Temporary email addresses are not allowed"
+    
+    # Verify domain has MX records (requires dnspython)
+    if DNS_AVAILABLE:
         try:
-            print("Form data:", request.form)
-            print("Current user:", current_user.id, current_user.name)
-            
-            user_id = current_user.id
-            user_name = current_user.name
-            
-            questions = list(mongo.db.preSurveyQuestion.find())
-            print("Questions from DB:", questions)
-            
-            answers = {}
-            for question in questions:
-                key = f"question_{question['_id']}"
-                answer = request.form.get(key)
-                print(f"Processing {key}: {answer}")
-                
-                if answer:
-                    answers[key] = answer
-            
-            if len(answers) != len(questions):
-                print("Not all questions answered")
-                flash("Please answer all questions.", "error")
-                return render_template('surveys/preSurvey.html', 
-                                    questions=questions, 
-                                    answers=answers)
-            
-            submission = {
-                'user_id': user_id,
-                'user_name': user_name,
-                'answers': answers,
-                'submitted_at': datetime.datetime.now(datetime.timezone.utc)
-            }
-
-            print("Saving submission:", submission)
-            mongo.db.preSurveyAnswers.insert_one(submission)
-            
-            track_activity_end(current_user.id, 'presurvey')
-            return redirect(url_for('programming_question', page_num=1))
-            
+            mx_records = resolver.resolve(domain, 'MX')
+            if not mx_records:
+                return False, "Email domain does not exist"
+        except resolver.NXDOMAIN:
+            return False, "Email domain does not exist"
+        except resolver.NoAnswer:
+            return False, "Email domain has no mail server"
         except Exception as e:
-            print("Error in preSurvey:", str(e))
-            print("Full error:", traceback.format_exc())
-            flash("An error occurred. Please try again.")
-            return render_template('surveys/preSurvey.html', 
-                                questions=questions)
+            # If we can't check, allow it (might be network issue)
+            print(f"Email validation warning: {str(e)}")
+            pass
+    
+    return True, "Valid email"
 
-    return render_template('surveys/preSurvey.html', questions=questions)
+# ============= Initialize Success Tracking Collection =============
+def initialize_success_tracking():
+    """Initialize collection to track successful completions"""
+    with app.app_context():
+        if 'user_success' not in mongo.db.list_collection_names():
+            mongo.db.create_collection('user_success')
+            mongo.db.user_success.create_index([('user_id', 1), ('question_id', 1)], unique=True)
+# Call this after other initializations
+initialize_success_tracking()
+# ============= Track Success Function =============
+def track_user_success(user_id, question_id, passed_all_tests, score, test_results):
+    """Track when a user successfully completes a question"""
+    try:
+        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        
+        success_record = {
+            'user_id': user_id,
+            'user_name': user.get('name', 'Unknown') if user else 'Unknown',
+            'user_email': user.get('email', 'Unknown') if user else 'Unknown',
+            'question_id': question_id,
+            'passed_all_tests': passed_all_tests,
+            'score': score,
+            'total_tests': len(test_results),
+            'passed_tests': sum(1 for r in test_results if r.get('status') == 'passed'),
+            'timestamp': datetime.datetime.utcnow(),
+            'submission_date': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Upsert - update if exists, insert if new
+        mongo.db.user_success.update_one(
+            {'user_id': user_id, 'question_id': question_id},
+            {'$set': success_record},
+            upsert=True
+        )
+        
+        print(f"✅ Success tracked: User {user_id} - {question_id} - Score: {score}%")
+        
+    except Exception as e:
+        print(f"Error tracking success: {str(e)}")
+
+def _insert_login_log(email, user_id):
+    """Helper to insert a login log for email."""
+    last_log = mongo.db.login_logs.find_one(sort=[("login_sequence", -1)])
+    if last_log and "login_sequence" in last_log:
+        next_sequence = last_log["login_sequence"] + 1
+    else:
+        next_sequence = 1
+    now_central = datetime.datetime.now(pytz.timezone('America/Chicago'))
+    login_log = {
+        "user_id": user_id,
+        "email": email,
+        "login_sequence": next_sequence,
+        "time": now_central
+    }
+    mongo.db.login_logs.insert_one(login_log)
+
+def run_cpp_multifile(files_dict: dict, input_data: str = "", timeout_sec: int = 5):
+    """
+    Compile and run multiple C++ files together
+    
+    Args:
+        files_dict: {"filename.cpp": "code content", "header.h": "header content"}
+        input_data: stdin input for the program
+        timeout_sec: execution timeout
+    
+    Returns:
+        dict with status, stdout, stderr
+    """
+    gxx = shutil.which("g++")
+    if not gxx:
+        return {"status": "error", "stdout": "", "stderr": "g++ not found on server"}
+    
+    if not EXEC_SEMAPHORE.acquire(timeout=0.5):
+        return {"status": "busy", "stdout": "", "stderr": "Runner busy, please retry."}
+    
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            # Write all files to temp directory
+            cpp_files = []
+            for filename, content in files_dict.items():
+                filepath = os.path.join(td, filename)
+                with open(filepath, "w") as f:
+                    f.write(content)
+                
+                # Track .cpp files for compilation
+                if filename.endswith('.cpp'):
+                    cpp_files.append(filepath)
+            
+            # Compile all .cpp files together
+            exe = os.path.join(td, "main.exe" if platform.system() == "Windows" else "main.out")
+            
+            compile_cmd = [gxx, "-std=c++17", "-O2"] + cpp_files + ["-o", exe]
+            
+            compile_proc = subprocess.run(
+                compile_cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                cwd=td  # Set working directory so #include works
+            )
+            
+            if compile_proc.returncode != 0:
+                return {
+                    "status": "compile_error",
+                    "stdout": compile_proc.stdout,
+                    "stderr": compile_proc.stderr
+                }
+            
+            # Run the compiled program
+            try:
+                proc = subprocess.Popen(
+                    [exe],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    preexec_fn=_limit_child_resources if (platform.system() != "Windows" and resource is not None) else None
+                )
+                out, err = proc.communicate(input=input_data, timeout=timeout_sec)
+                return {"status": "ok", "stdout": out, "stderr": err}
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                return {"status": "timeout", "stdout": "", "stderr": "Execution timed out"}
+                
+    except Exception as e:
+        return {"status": "error", "stdout": "", "stderr": str(e)}
+    finally:
+        EXEC_SEMAPHORE.release()
 
 
+def run_code_with_test_cases_multifile(language: str, files_dict: dict, test_cases: list):
+    """
+    Run multi-file code with test cases
+    
+    Args:
+        language: "cpp" 
+        files_dict: {"BankAccount.h": "...", "BankAccount.cpp": "...", "main.cpp": "..."}
+        test_cases: list of test case dicts
+    """
+    if not test_cases:
+        return [{"test_name": "No tests", "status": "error", "error": "No test cases configured"}]
+    
+    if language.lower() != "cpp":
+        return [{"test_name": "Runner", "status": "error", "error": "Multi-file only supports C++"}]
+    
+    gxx = shutil.which("g++")
+    if not gxx:
+        return [{"test_name": "Compile", "status": "error", "error": "g++ not found"}]
+    
+    results = []
+    
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            # Write all files
+            cpp_files = []
+            for filename, content in files_dict.items():
+                filepath = os.path.join(td, filename)
+                with open(filepath, "w") as f:
+                    f.write(content)
+                if filename.endswith('.cpp'):
+                    cpp_files.append(filepath)
+            
+            exe = os.path.join(td, "main.exe" if platform.system() == "Windows" else "main.out")
+            
+            # Compile
+            compile_proc = subprocess.run(
+                [gxx, "-std=c++17", "-O2"] + cpp_files + ["-o", exe],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=td
+            )
+            
+            if compile_proc.returncode != 0:
+                return [{
+                    "test_name": "Compile",
+                    "status": "compile_error",
+                    "input": "",
+                    "expected": "",
+                    "actual": compile_proc.stdout,
+                    "error": compile_proc.stderr
+                }]
+            
+            # Run test cases
+            for i, tc in enumerate(test_cases, 1):
+                name = tc.get("test_name", f"Test Case {i}")
+                expected = (tc.get("expected_output") or "").strip()
+                input_data = tc.get("input") or ""
+                
+                try:
+                    if not EXEC_SEMAPHORE.acquire(timeout=0.5):
+                        results.append({
+                            "test_name": name,
+                            "status": "error",
+                            "error": "Runner busy, please retry.",
+                            "input": input_data
+                        })
+                        continue
+                    
+                    proc = subprocess.Popen(
+                        [exe],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        preexec_fn=_limit_child_resources if (platform.system() != "Windows" and resource is not None) else None
+                    )
+                    
+                    out, err = proc.communicate(input=input_data, timeout=5)
+                    actual = (out or "").strip()
+                    ok = (" ".join(actual.split()) == " ".join(expected.split()))
+                    
+                    results.append({
+                        "test_name": name,
+                        "input": input_data,
+                        "expected": expected,
+                        "actual": actual,
+                        "status": "passed" if ok else "failed",
+                        **({"stderr": err} if err else {})
+                    })
+                    
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    results.append({
+                        "test_name": name,
+                        "status": "error",
+                        "error": "Execution timed out (5s)",
+                        "input": input_data
+                    })
+                finally:
+                    try:
+                        EXEC_SEMAPHORE.release()
+                    except Exception:
+                        pass
+                        
+    except Exception as e:
+        results.append({"test_name": "System", "status": "error", "error": str(e)})
+    
+    return results
+# ============= Code Execution Functions =============
 def run_code_with_test_cases(code, test_cases):
+    """Run Python code with test cases"""
     results = []
     
     for i, test_case in enumerate(test_cases):
@@ -326,100 +855,32 @@ def run_code_with_test_cases(code, test_cases):
         test_name = test_case.get('test_name', f'Test Case {i+1}')
         
         try:
-            # Create a temporary file for the test
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-                # Start with imports that might be needed
-                f.write("import sys\n")
-                f.write("import io\n")
-                f.write("import asyncio\n\n")
-                
-                # Write the student's code first
+                f.write("import sys\nimport io\nimport asyncio\n\n")
                 f.write(code + "\n\n")
                 
-                # Apply code_setup if provided
                 if code_setup:
-                    # Handle function replacement cases
-                    if code_setup.startswith('def ') or code_setup.startswith('async def '):
-                        # Extract function name
-                        func_name = code_setup.split('def ')[1].split('(')[0].strip()
-                        
-                        # Add a modified version of the function that will override the original
-                        f.write("# Test function replacement\n")
-                        f.write(f"{code_setup}\n\n")
-                    else:
-                        # Just add the setup code
-                        f.write("# Additional test setup\n")
-                        f.write(f"{code_setup}\n\n")
+                    f.write(f"{code_setup}\n\n")
                 
-                # Add general test runner code
                 f.write("""
-# Test execution wrapper
 if __name__ == '__main__':
-    # Capture output
     output_capture = io.StringIO()
     original_stdout = sys.stdout
     sys.stdout = output_capture
     
     try:
-        # Try different execution methods based on what's available
-        
-        # First check for specific test patterns
         if 'print_flow' in globals():
-            # Execute print_flow if it exists (special test case)
             print_flow()
-            
-        # Check for normal main function
         elif 'main' in globals():
-            # Execute main function
             main()
-            
-        # Look for async functions that might need to be run
-        else:
-            # Find all async functions
-            async_funcs = [name for name, func in globals().items() 
-                          if callable(func) and hasattr(func, '__await__')
-                          and not name.startswith('__')]
-            
-            # If we have async functions, run the first one
-            if async_funcs:
-                asyncio.run(globals()[async_funcs[0]]())
-            else:
-                # Look for any regular function that might be the main test target
-                regular_funcs = [name for name, func in globals().items()
-                                if callable(func) and not name.startswith('__') 
-                                and not hasattr(func, '__await__')]
-                
-                # If there's input data and we have a function, try calling it with the input
-                if regular_funcs and '""" + input_data + """':
-                    # Try to evaluate the input and call the function
-                    try:
-                        input_val = eval('""" + input_data + """')
-                        result = globals()[regular_funcs[0]](input_val)
-                        if result is not None:
-                            print(result)
-                    except:
-                        # If eval fails, just call without args
-                        result = globals()[regular_funcs[0]]()
-                        if result is not None:
-                            print(result)
-                elif regular_funcs:
-                    # Just call the first function without args
-                    result = globals()[regular_funcs[0]]()
-                    if result is not None:
-                        print(result)
-    
     except Exception as e:
-        # Print exception but continue to capture it
         print(f"Error: {str(e)}")
     
-    # Restore stdout and get output
     sys.stdout = original_stdout
     print(output_capture.getvalue().strip())
 """)
-                
                 temp_file = f.name
             
-            # Run the test file as a separate process
             process = subprocess.Popen(
                 ['python3', temp_file],
                 stdin=subprocess.PIPE if input_data else None,
@@ -428,40 +889,18 @@ if __name__ == '__main__':
                 text=True
             )
             
-            # Get the results with timeout protection
             try:
                 stdout, stderr = process.communicate(input=input_data if input_data else None, timeout=10)
-                
-                # Process the output for special cases
                 actual_output = stdout.strip()
                 error_msg = stderr.strip()
                 
-                # Determine if the test passed
-                if expected_output.startswith('[') and expected_output.endswith(']'):
-                    # Try to compare as Python objects for lists
-                    try:
-                        expected_list = eval(expected_output)
-                        # Try to evaluate actual output as a list
-                        if actual_output.startswith('[') and actual_output.endswith(']'):
-                            actual_list = eval(actual_output)
-                            status = 'passed' if actual_list == expected_list else 'failed'
-                        else:
-                            status = 'failed'
-                    except:
-                        # Fall back to string comparison
-                        status = 'passed' if actual_output == expected_output else 'failed'
-                else:
-                    # For non-list outputs, normalize and compare
-                    expected_norm = ' '.join(expected_output.split())
-                    actual_norm = ' '.join(actual_output.split())
-                    status = 'passed' if actual_norm == expected_norm else 'failed'
+                expected_norm = ' '.join(expected_output.split())
+                actual_norm = ' '.join(actual_output.split())
+                status = 'passed' if actual_norm == expected_norm else 'failed'
                 
-                # Check for errors
-                if error_msg and "Traceback" in error_msg:
-                    if "RuntimeWarning" not in error_msg:  # Ignore runtime warnings
-                        status = 'error'
+                if error_msg and "Traceback" in error_msg and "RuntimeWarning" not in error_msg:
+                    status = 'error'
                 
-                # Create the result
                 result = {
                     'test_name': test_name,
                     'input': input_data,
@@ -483,13 +922,11 @@ if __name__ == '__main__':
                     'error': 'Code execution timed out (10 seconds)',
                     'input': input_data
                 })
-                
-            # Clean up
+            
             if os.path.exists(temp_file):
                 os.unlink(temp_file)
                 
         except Exception as e:
-            import traceback
             results.append({
                 'test_name': test_name,
                 'status': 'error',
@@ -497,267 +934,429 @@ if __name__ == '__main__':
                 'traceback': traceback.format_exc()
             })
     
-    # Ensure we return something even if all tests fail to run
     if not results:
         results.append({
             'test_name': 'System Error',
             'status': 'error',
-            'error': 'No test results were generated. The test system may be misconfigured.',
+            'error': 'No test results were generated.',
             'actual': '',
             'expected': ''
         })
     
     return results
 
-@app.route('/programming/<page_num>/autosave', methods=['POST'])
-@login_required
-def autosave_code(page_num):
-    try:
-        code = request.json.get('code')
-        current_time = datetime.datetime.utcnow()
-        
-        # Create a new document for each autosave to maintain history
-        autosave_doc = {
-            'user_id': current_user.id,
-            'question_id': f'programming_q{page_num}',
-            'code': code,
-            'saved_at': current_time
-        }
-        
-        # Insert a new document for each autosave
-        mongo.db.code_autosaves.insert_one(autosave_doc)
-        
-        # Don't update any "latest" collection since we don't want to retrieve this code
-        
-        return jsonify({'status': 'success', 'message': 'Code auto-saved'})
-    except Exception as e:
-        print(f"Autosave error: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+def run_code_with_test_cases_multi(language: str, code: str, test_cases: list):
+    """Run code with test cases - supports Python and C++"""
+    if not test_cases:
+        return [{"test_name": "No tests", "status": "error", "error": "No test cases configured"}]
     
+    if language.lower() != "cpp":
+        return [{"test_name": "Runner", "status": "error", "error": f"Unsupported language: {language}"}]
+    
+    if language.lower() == "python":
+        return run_code_with_test_cases(code, test_cases)
+    
+    
+    
+    gxx = shutil.which("g++")
+    if not gxx:
+        return [{"test_name": "Compile", "status": "error", "error": "g++ not found"}]
+    
+    results = []
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "main.cpp")
+            exe = os.path.join(td, "main.exe" if platform.system() == "Windows" else "main.out")
+            
+            with open(src, "w") as f:
+                f.write(code)
+            
+            compile_proc = subprocess.run(
+                [gxx, "-std=c++17", "-O2", src, "-o", exe],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if compile_proc.returncode != 0:
+                return [{
+                    "test_name": "Compile",
+                    "status": "compile_error",
+                    "input": "",
+                    "expected": "",
+                    "actual": compile_proc.stdout,
+                    "error": compile_proc.stderr
+                }]
+            
+            for i, tc in enumerate(test_cases, 1):
+                name = tc.get("test_name", f"Test Case {i}")
+                expected = (tc.get("expected_output") or "").strip()
+                input_data = tc.get("input") or ""
+                
+                try:
+                    if not EXEC_SEMAPHORE.acquire(timeout=0.5):
+                        results.append({
+                            "test_name": name,
+                            "status": "error",
+                            "error": "Runner busy, please retry.",
+                            "input": input_data
+                        })
+                        continue
+                    
+                    proc = subprocess.Popen(
+                        [exe],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        preexec_fn=_limit_child_resources if (platform.system() != "Windows" and resource is not None) else None
+                    )
+                    
+                    out, err = proc.communicate(input=input_data, timeout=5)
+                    actual = (out or "").strip()
+                    ok = (" ".join(actual.split()) == " ".join(expected.split()))
+                    
+                    results.append({
+                        "test_name": name,
+                        "input": input_data,
+                        "expected": expected,
+                        "actual": actual,
+                        "status": "passed" if ok else "failed",
+                        **({"stderr": err} if err else {})
+                    })
+                    
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    results.append({
+                        "test_name": name,
+                        "status": "error",
+                        "error": "Execution timed out (5s)",
+                        "input": input_data
+                    })
+                finally:
+                    try:
+                        EXEC_SEMAPHORE.release()
+                    except Exception:
+                        pass
+                        
+    except Exception as e:
+        results.append({"test_name": "System", "status": "error", "error": str(e)})
+    
+    return results
+
+def run_python_once(code: str, input_data: str = "", timeout_sec: int = 5):
+    """Run Python code once with input"""
+    py = shutil.which("python3") or shutil.which("python")
+    if not py:
+        return {"status": "error", "stdout": "", "stderr": "Python interpreter not found"}
+    
+    if not EXEC_SEMAPHORE.acquire(timeout=0.5):
+        return {"status": "busy", "stdout": "", "stderr": "Runner busy, please retry."}
+    
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "main.py")
+            with open(src, "w") as f:
+                f.write(code)
+            
+            try:
+                proc = subprocess.Popen(
+                    [py, src],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    preexec_fn=_limit_child_resources if (platform.system() != "Windows" and resource is not None) else None
+                )
+                out, err = proc.communicate(input=input_data, timeout=timeout_sec)
+                return {"status": "ok", "stdout": out, "stderr": err}
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                return {"status": "timeout", "stdout": "", "stderr": "Execution timed out"}
+    except Exception as e:
+        return {"status": "error", "stdout": "", "stderr": str(e)}
+    finally:
+        try:
+            EXEC_SEMAPHORE.release()
+        except Exception:
+            pass
+
+def run_cpp_once(code: str, input_data: str = "", timeout_sec: int = 5):
+    """Compile and run C++ code once"""
+    gxx = shutil.which("g++")
+    if not gxx:
+        return {"status": "error", "stdout": "", "stderr": "g++ not found on server"}
+    
+    if not EXEC_SEMAPHORE.acquire(timeout=0.5):
+        return {"status": "busy", "stdout": "", "stderr": "Runner busy, please retry."}
+    
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "main.cpp")
+            exe = os.path.join(td, "main.exe" if platform.system() == "Windows" else "main.out")
+            
+            with open(src, "w") as f:
+                f.write(code)
+            
+            compile_proc = subprocess.run(
+                [gxx, "-std=c++17", "-O2", src, "-o", exe],
+                capture_output=True,
+                text=True,
+                timeout=20
+            )
+            
+            if compile_proc.returncode != 0:
+                return {
+                    "status": "compile_error",
+                    "stdout": compile_proc.stdout,
+                    "stderr": compile_proc.stderr
+                }
+            
+            try:
+                proc = subprocess.Popen(
+                    [exe],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    preexec_fn=_limit_child_resources if (platform.system() != "Windows" and resource is not None) else None
+                )
+                out, err = proc.communicate(input=input_data, timeout=timeout_sec)
+                return {"status": "ok", "stdout": out, "stderr": err}
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                return {"status": "timeout", "stdout": "", "stderr": "Execution timed out"}
+    except Exception as e:
+        return {"status": "error", "stdout": "", "stderr": str(e)}
+    finally:
+        EXEC_SEMAPHORE.release()
+
+# ============= User Model =============
+with app.app_context():
+    if 'users' not in mongo.db.list_collection_names():
+        mongo.db.create_collection('users')
+
+class User(UserMixin):
+    def __init__(self, user_data):
+        self.id = str(user_data['_id'])
+        self.name = user_data['name']
+        self.email = user_data['email']
+        self.research_group = user_data.get('research_group', 'experiment')
+
+@login_manager.user_loader
+def load_user(user_id):
+    user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    return User(user_data) if user_data else None
+
+# ============= Flask Routes =============
+@app.after_request
+def add_no_cache_headers(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+@app.route('/', methods=['GET', 'POST'])
+def register():
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        email = form.email.data
+        
+        # Validate email
+        is_valid, message = is_valid_email(email)
+        if not is_valid:
+            flash(f'Registration failed: {message}', 'error')
+            return render_template('auth/register.html', title='Register', form=form)
+        
+        existing_user = mongo.db.users.find_one({'email': email})
+        if existing_user:
+            flash('Email already exists. Please login.')
+            return redirect(url_for('login'))
+        
+        hashed_password = bcrypt.hashpw(form.password.data.encode('utf-8'), bcrypt.gensalt())
+        user = {
+            'name': form.name.data,
+            'email': email,
+            'password': hashed_password.decode('utf-8'),
+            'research_group': 'experiment'
+        }
+        result = mongo.db.users.insert_one(user)
+        
+        mongo.db.user_activities.insert_one({
+            'user_id': str(result.inserted_id),
+            'activity': 'group_assignment',
+            'group': 'experiment',
+            'timestamp': datetime.datetime.utcnow()
+        })
+        
+        flash('Registration successful!')
+        return redirect(url_for('login'))
+    
+    return render_template('auth/register.html', title='Register', form=form)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        user_data = mongo.db.users.find_one({'email': form.email.data})
+        if user_data and bcrypt.checkpw(form.password.data.encode('utf-8'), user_data['password'].encode('utf-8')):
+            # COMMENTED OUT: Random group assignment for existing users
+            # if 'research_group' not in user_data or not user_data['research_group']:
+            #     group = random.choice(['experiment', 'control'])
+            #     mongo.db.users.update_one(
+            #         {'_id': user_data['_id']},
+            #         {'$set': {'research_group': group}}
+            #     )
+            #     mongo.db.user_activities.insert_one({
+            #         'user_id': str(user_data['_id']),
+            #         'activity': 'group_assignment',
+            #         'group': group,
+            #         'timestamp': datetime.datetime.utcnow()
+            #     })
+            
+            # Always set to experiment if missing
+            if 'research_group' not in user_data or not user_data['research_group']:
+                mongo.db.users.update_one(
+                    {'_id': user_data['_id']},
+                    {'$set': {'research_group': 'experiment'}}
+                )
+            
+            user_obj = User(user_data)
+            login_user(user_obj)
+            return redirect(url_for('presurvey'))
+        flash('Invalid email or password')
+    return render_template('auth/login.html', title='Login', form=form)
+
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    form = ForgotPasswordForm()
+    if form.validate_on_submit():
+        email = form.email.data
+        user = mongo.db.users.find_one({'email': email})
+        if user:
+            new_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+            hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
+            mongo.db.users.update_one({'email': email}, {'$set': {'password': hashed_password.decode('utf-8')}})
+            
+            msg = Message("Your New Password", sender=app.config['MAIL_USERNAME'], recipients=[email])
+            msg.body = f"Your new password is: {new_password}\nYou can now log in with this password."
+            mail.send(msg)
+            
+            flash('A new password has been sent to your email.', 'info')
+            return redirect(url_for('login'))
+        else:
+            flash('Email not found.', 'danger')
+    return render_template('auth/forgot_password.html', title='Forgot Password', form=form)
+
+@app.route('/preSurvey', methods=['GET', 'POST'])
+@login_required
+def presurvey():
+    if request.method == 'GET':
+        track_activity_start(current_user.id, 'presurvey')
+        questions = list(mongo.db.preSurveyQuestion.find())
+        return render_template('surveys/preSurvey.html', questions=questions)
+    
+    elif request.method == 'POST':
+        try:
+            user_id = current_user.id
+            user_name = current_user.name
+            questions = list(mongo.db.preSurveyQuestion.find())
+            
+            answers = {}
+            for question in questions:
+                key = f"question_{question['_id']}"
+                answer = request.form.get(key)
+                if answer:
+                    answers[key] = answer
+            
+            if len(answers) != len(questions):
+                flash("Please answer all questions.", "error")
+                return render_template('surveys/preSurvey.html', questions=questions, answers=answers)
+            
+            submission = {
+                'user_id': user_id,
+                'user_name': user_name,
+                'answers': answers,
+                'submitted_at': datetime.datetime.now(datetime.timezone.utc)
+            }
+            
+            mongo.db.preSurveyAnswers.insert_one(submission)
+            track_activity_end(current_user.id, 'presurvey')
+            return redirect(url_for('programming_question', page_num=1))
+            
+        except Exception as e:
+            print("Error in preSurvey:", str(e))
+            traceback.print_exc()
+            flash("An error occurred. Please try again.")
+            return render_template('surveys/preSurvey.html', questions=questions)
 
 @app.route('/programming/<page_num>')
 @login_required
 def programming_question(page_num):
     try:
-        # Format the question_id consistently
         question_id = f'programming_q{page_num}'
+        track_activity_start(current_user.id, question_id)
         
-        # Track activity start with try/except to ensure it doesn't break the page
-        try:
-            track_activity_start(current_user.id, question_id)
-        except Exception as tracking_error:
-            print(f"Error tracking activity start: {tracking_error}")
-            # Continue with the page even if tracking fails
-        
-        # Get the question from MongoDB using question_id format
         question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
-        print(f"Found question: {question}")  # Debug print
-        
         if not question:
-            print(f"No question found for {question_id}")
             flash('Programming question not found.', 'error')
             return render_template('programming/programming.html',
-                            question={'question_text': 'Question not found'},
-                            code='',
-                            page_num=page_num)
+                                   question={'question_text': 'Question not found'},
+                                   code='', page_num=page_num)
         
-        # First try to get autosaved code
-        autosaved = mongo.db.code_autosaves.find_one({
-            'user_id': current_user.id,
-            'question_id': question_id
-        }, sort=[('saved_at', -1)])  # Get the most recent autosave
+        autosaved = mongo.db.code_autosaves.find_one(
+            {'user_id': current_user.id, 'question_id': question_id},
+            sort=[('saved_at', -1)]
+        )
         
-        # If no autosave exists, try to get submitted code
         if not autosaved:
             submitted = mongo.db.submissions.find_one({
                 'user_id': current_user.id,
                 'question_id': question_id
             })
-            # If there's submitted code, use it; otherwise, use starter_code from question
-            if submitted and submitted.get('code'):
-                code = submitted.get('code')
-            else:
-                # Use the starter code from the question document
-                code = question.get('starter_code', '')
+            code = submitted.get('code') if submitted and submitted.get('code') else question.get('starter_code', '')
         else:
             code = autosaved.get('code')
         
-        # Add timer duration to the template context (in minutes)
-        # You can customize timer duration per question
-        if page_num == '1':
-            timer_duration = 20  # 20 minutes for question 1
-        elif page_num == '2':
-            timer_duration = 30  # 30 minutes for question 2
-        else:
-            timer_duration = 30  # Default is 30 minutes
+        timer_duration = 20 if page_num == '1' else 30
         
-        # Check user's research group and render appropriate template
-        group = getattr(current_user, 'research_group', 'experiment')  # Default to experiment if not set
-        if group == 'control':
-            # Control group: Custom SRL prompts (hardcoded example; you can fetch from DB)
-            srl_prompts = [
-                "What is your learning goal for this programming task?",
-                "How do you plan to approach solving this problem?",
-                "What strategies will you use to test and debug your code?",
-                "Reflect on any errors: What caused them and how can you fix them?",
-                "How does this task relate to what you've learned before?"
-            ]
-            # Render SRL-specific template (create this template without AI features)
-            return render_template('programming/programming_srl.html',
-                                   question=question,
-                                   code=code,
-                                   page_num=page_num,
-                                   timer_duration=timer_duration,
-                                   srl_prompts=srl_prompts)  # Pass SRL prompts to template
-        else:
-            # Experiment group: Standard AI-assisted template
-            return render_template('programming/programming.html',
-                                   question=question,
-                                   code=code,
-                                   page_num=page_num,
-                                   timer_duration=timer_duration)  # Pass timer duration to template
+        # COMMENTED OUT: Control group logic
+        # group = getattr(current_user, 'research_group', 'experiment')
+        # if group == 'control':
+        #     srl_prompts = [
+        #         "What is your learning goal for this programming task?",
+        #         "How do you plan to approach solving this problem?",
+        #         "What strategies will you use to test and debug your code?",
+        #         "Reflect on any errors: What caused them and how can you fix them?",
+        #         "How does this task relate to what you've learned before?"
+        #     ]
+        #     return render_template('programming/programming_srl.html',
+        #                            question=question, code=code, page_num=page_num,
+        #                            timer_duration=timer_duration, srl_prompts=srl_prompts)
+        # else:
+        
+        # Always use SRL AI assistant
+        return render_template('programming/programming.html',
+                               question=question, code=code, page_num=page_num,
+                               timer_duration=timer_duration)
                           
     except Exception as e:
         print(f"Error in programming_question: {str(e)}")
         traceback.print_exc()
         flash('Error loading programming question', 'error')
         return render_template('programming/programming.html',
-                          question={'question_text': 'Error loading question'},
-                          code='',
-                          page_num=page_num)
+                               question={'question_text': 'Error loading question'},
+                               code='', page_num=page_num)
     
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-def format_test_results(test_results):
-    """Helper to format test results as a readable string."""
-    if not test_results:
-        return "No test results available."
-    formatted = ""
-    for result in test_results:
-        formatted += f"Test: {result.get('test_name', 'Unknown')}\n"
-        formatted += f"Status: {result.get('status', 'Unknown')}\n"
-        formatted += f"Input: {result.get('input', '')}\n"
-        formatted += f"Expected: {result.get('expected', '')}\n"
-        formatted += f"Actual: {result.get('actual', '')}\n"
-        if 'error' in result:
-            formatted += f"Error: {result['error']}\n"
-        formatted += "\n"
-    return formatted
-
-@app.route('/programming/<page_num>/prompt', methods=['POST'])
-@login_required
-def programming_prompt(page_num):
-    prompt = request.form.get('prompt')
-    code = request.form.get('code', '')
-
-    group = getattr(current_user, 'research_group', 'experiment')
-    if group == 'control':
-        # log reflection and bail (no AI)
-        mongo.db.reflections.insert_one({
-            'user_id': current_user.id,
-            'question_id': f'programming_q{page_num}',
-            'prompt': prompt,
-            'timestamp': datetime.datetime.utcnow()
-        })
-        flash('AI assistance is not available in your group.', 'warning')
-        return redirect(url_for('programming_question', page_num=page_num))
-    try:
-        question_id = f'programming_q{page_num}'
-        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
-        question_text = question.get('question_text', 'No question text available.') if question else 'No question text available.'
-        
-        latest_run = mongo.db.run_attempts.find_one(
-            {'user_id': current_user.id, 'question_id': question_id},
-            sort=[('timestamp', -1)]
-        )
-        latest_test_results = ""
-        if latest_run:
-            if 'test_results' in latest_run:
-                latest_test_results = format_test_results(latest_run['test_results'])
-            elif 'output' in latest_run:
-                latest_test_results = latest_run['output']
-
-        # NEW: Load or initialize conversation history
-        conversation = mongo.db.conversations.find_one({
-            'user_id': current_user.id,
-            'question_id': question_id
-        })
-        history = conversation.get('history', []) if conversation else []
-
-        # Construct system content (always first in messages)
-        system_content = (
-            f"You are a helpful programming assistant. "
-            f"The programming task is: {question_text}\n"
-            f"Current code in editor: {code}\n"
-            f"Latest terminal outputs/test results: {latest_test_results or 'No previous runs.'}"
-        )
-
-        # Build messages: system + history + new user prompt
-        messages = [
-            {"role": "system", "content": system_content}
-        ] + history + [
-            {"role": "user", "content": prompt}
-        ]
-
-        # Send to ChatGPT with full history
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=0.7
-        )
-        
-        ai_response = response.choices[0].message.content
-        
-        # NEW: Append new user prompt and AI response to history
-        history.append({"role": "user", "content": prompt})
-        history.append({"role": "assistant", "content": ai_response})
-
-        # Save/upsert updated history
-        mongo.db.conversations.update_one(
-            {'user_id': current_user.id, 'question_id': question_id},
-            {'$set': {'history': history}},
-            upsert=True
-        )
-        
-        # Log the interaction (optional, keep as-is)
-        mongo.db.ai_interactions.insert_one({
-            'user_id': current_user.id,
-            'question_id': question_id,
-            'prompt': prompt,
-            'ai_response': ai_response,
-            'timestamp': datetime.datetime.utcnow()
-        })
-        
-    except Exception as e:
-        ai_response = f"Error: {str(e)}"
-    
-    if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
-        return ai_response
-    
-    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
-    return render_template('programming/programming.html',
-                         question=question,
-                         code=code,
-                         page_num=page_num,
-                         ai_response=ai_response,
-                         prompt=prompt)
-
-
 @app.route('/programming/<page_num>/run', methods=['POST'])
 @login_required
 def programming_run(page_num):
     code = request.form.get('code')
     question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
     
-    # Get test cases from the question
     test_cases = question.get('test_cases', [])
-    
-    # Use the improved test case runner
     test_results = run_code_with_test_cases(code, test_cases)
     
-    # Log the run attempt
     mongo.db.run_attempts.insert_one({
         'user_id': current_user.id,
         'question_id': f'programming_q{page_num}',
@@ -766,17 +1365,13 @@ def programming_run(page_num):
         'timestamp': datetime.datetime.utcnow()
     })
     
-    # Return to the same page with test results
     return render_template('programming/programming.html',
-                         question=question,
-                         code=code,
-                         page_num=page_num,
-                         test_results=test_results)
+                           question=question, code=code, page_num=page_num,
+                           test_results=test_results)
 
 @app.route('/programming/<page_num>/submit', methods=['POST'])
 @login_required
 def programming_submit(page_num):
-    print(f"Received submission for page {page_num}")
     try:
         code = request.form.get('code')
         question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
@@ -785,16 +1380,14 @@ def programming_submit(page_num):
             flash('Question not found', 'error')
             return redirect(url_for('programming_question', page_num=page_num))
         
-        # Run final tests
         test_cases = question.get('test_cases', [])
         test_results = run_code_with_test_cases(code, test_cases)
         
-        # Calculate score
         total_tests = len(test_results)
         passed_tests = sum(1 for result in test_results if result['status'] == 'passed')
         score = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
+        passed_all = (passed_tests == total_tests) and total_tests > 0
         
-        # Save submission
         submission = {
             'user_id': current_user.id,
             'question_id': f'programming_q{page_num}',
@@ -803,42 +1396,30 @@ def programming_submit(page_num):
             'score': score,
             'timestamp': datetime.datetime.now(datetime.timezone.utc)
         }
-
-        # Save to MongoDB using upsert
+        
         mongo.db.submissions.update_one(
-            {
-                'user_id': current_user.id,
-                'question_id': f'programming_q{page_num}'
-            },
+            {'user_id': current_user.id, 'question_id': f'programming_q{page_num}'},
             {'$set': submission},
             upsert=True
         )
         
+        # ✅ Track success for analytics
+        track_user_success(current_user.id, f'programming_q{page_num}', passed_all, score, test_results)
+        
         track_activity_end(current_user.id, f'programming_q{page_num}')
         
-        # Updated: No feedback; redirect based on page_num
-        if page_num == '1':
-            return redirect(url_for('programming_question', page_num='2'))
-        elif page_num == '2':
-            return redirect(url_for('postsurvey'))
-        else:
-            flash('Submission complete.', 'success')
-            return redirect(url_for('programming_question', page_num=page_num))
+        # ✅ ALWAYS GO TO POST-SURVEY (FOR SINGLE QUESTION STUDY)
+        flash('Submission complete. Please complete the post-survey.', 'success')
+        return redirect(url_for('postsurvey'))
         
     except Exception as e:
         print("Error in submit:", str(e))
         traceback.print_exc()
         flash('Error submitting solution', 'error')
-        
-        # Updated: No feedback; redirect based on page_num even on error
-        if page_num == '1':
-            return redirect(url_for('programming_question', page_num='2'))
-        elif page_num == '2':
-            return redirect(url_for('postsurvey'))
-        else:
-            return redirect(url_for('programming_question', page_num=page_num))
+        # ✅ Even on error, redirect to post-survey
+        return redirect(url_for('postsurvey'))
 
-# (Feedback route removed as per request)
+
 
 @app.route('/postSurvey', methods=['GET', 'POST'])
 @login_required
@@ -850,30 +1431,20 @@ def postsurvey():
     
     elif request.method == 'POST':
         try:
-            print("Form data:", request.form)
-            print("Current user:", current_user.id, current_user.name)
-            
             user_id = current_user.id
             user_name = current_user.name
-            
             questions = list(mongo.db.postSurveyQuestion.find())
-            print("Questions from DB:", questions)
             
             answers = {}
             for question in questions:
                 key = f"question_{question['_id']}"
                 answer = request.form.get(key)
-                print(f"Processing {key}: {answer}")
-                
                 if answer:
                     answers[key] = answer
             
             if len(answers) != len(questions):
-                print("Not all questions answered")
                 flash("Please answer all questions.", "error")
-                return render_template('surveys/postSurvey.html',
-                                      questions=questions,
-                                      answers=answers)
+                return render_template('surveys/postSurvey.html', questions=questions, answers=answers)
             
             submission = {
                 'user_id': user_id,
@@ -881,107 +1452,78 @@ def postsurvey():
                 'answers': answers,
                 'submitted_at': datetime.datetime.now(datetime.timezone.utc)
             }
-
+            
             mongo.db.postSurveyAnswers.insert_one(submission)
             track_activity_end(current_user.id, 'postsurvey')
-            # Update user status to indicate completion of the entire process
+            
             mongo.db.users.update_one(
                 {'_id': ObjectId(user_id)},
                 {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.timezone.utc)}}
             )
             
-            flash("Thank you for completing the survey! Your participation has been recorded.")
-            return redirect(url_for('completion_page'))  # Final thank you/completion page
+            flash("Thank you for completing the survey!")
+            return redirect(url_for('completion_page'))
             
         except Exception as e:
             print("Error in postSurvey:", str(e))
-            print("Full error:", traceback.format_exc())
+            traceback.print_exc()
             flash("An error occurred. Please try again.")
-            return render_template('surveys/postSurvey.html',
-                                  questions=questions)
-    
-    return render_template('surveys/postSurvey.html', questions=questions)
+            return render_template('surveys/postSurvey.html', questions=questions)
 
 @app.route('/completion')
 @login_required
 def completion_page():
     return render_template('completion.html', 
-                          user_name=current_user.name,
-                          now=datetime.datetime.now())
+                           user_name=current_user.name,
+                           now=datetime.datetime.now())
 
+@app.route('/debug/conversations/<user_id>/<question_id>', methods=['GET'])
+@login_required  
+def debug_conversations(user_id, question_id):
+    conversation = mongo.db.conversations.find_one({
+        'user_id': user_id,
+        'question_id': question_id
+    })
+    if conversation:
+        return jsonify(conversation['history'])
+    else:
+        return jsonify({'message': 'No conversation found'}), 404
 
-
-
+# ============= JWT Token Handlers =============
 @jwt.expired_token_loader
 def expired_token_callback(jwt_header, jwt_payload):
-    return jsonify({
-        'status': 'error',
-        'message': 'Token has expired'
-    }), 401
+    return jsonify({'status': 'error', 'message': 'Token has expired'}), 401
 
 @jwt.invalid_token_loader
 def invalid_token_callback(error):
-    return jsonify({
-        'status': 'error',
-        'message': 'Invalid token'
-    }), 401
+    return jsonify({'status': 'error', 'message': 'Invalid token'}), 401
 
 @jwt.unauthorized_loader
 def unauthorized_callback(error):
-    return jsonify({
-        'status': 'error',
-        'message': 'Missing authorization token'
-    }), 401
+    return jsonify({'status': 'error', 'message': 'Missing authorization token'}), 401
 
-# Add this route to your blueprint
+# ============= API Routes =============
 @api_bp.route('/check-token', methods=['GET'])
 @jwt_required()
 def check_token():
-    # If we get here, the token is valid
-    # Optional: Add user details if needed
     current_user_id = get_jwt_identity()
     return jsonify({
         'status': 'success',
         'message': 'Token is valid',
         'user_id': current_user_id
     }), 200
-
-def _insert_login_log(email, user_id):
-    """
-    Helper to insert a login log for `email`. Uses a global counter
-    'login_sequence' in login_logs collection.
-    """
-    # Find the document with the highest existing login_sequence
-    last_log = mongo.db.login_logs.find_one(sort=[("login_sequence", -1)])
-    if last_log and "login_sequence" in last_log:
-        next_sequence = last_log["login_sequence"] + 1
-    else:
-        next_sequence = 1
-
-    # Current time in US Central / America/Chicago via pytz
-    now_central = datetime.datetime.now(pytz.timezone('America/Chicago'))
-
-    # Build and insert the login_log
-    login_log = {
-        "user_id": user_id,
-        "email": email,
-        "login_sequence": next_sequence,
-        "time": now_central
-    }
-    mongo.db.login_logs.insert_one(login_log)
-
 @api_bp.route('/microsoft_login', methods=['POST'])
 def microsoft_login():
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No input data provided"}), 400
-
+    
     email = data.get("email", "").lower()
     name = data.get("name")
+    
     if not email or not name:
         return jsonify({"status": "error", "message": "Missing required fields"}), 400
-
-    # find-or-create
+    
     existing_user = mongo.db.users.find_one({"email": email})
     if existing_user:
         user_id = str(existing_user["_id"])
@@ -993,49 +1535,47 @@ def microsoft_login():
             "name": name,
             "email": email,
             "password": hashed_password.decode("utf-8"),
+            "research_group": "experiment"  # Always experiment
         }
         result = mongo.db.users.insert_one(new_user)
         user_id = str(result.inserted_id)
-
-    # Check and assign research group if not set (randomization)
+    
+    # COMMENTED OUT: Random group assignment
+    # try:
+    #     user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+    #     if 'research_group' not in user_data or not user_data['research_group']:
+    #         group = random.choice(['experiment', 'control'])
+    #         mongo.db.users.update_one(
+    #             {'_id': ObjectId(user_id)},
+    #             {'$set': {'research_group': group}}
+    #         )
+    #         mongo.db.user_activities.insert_one({
+    #             'user_id': user_id,
+    #             'activity': 'group_assignment',
+    #             'group': group,
+    #             'timestamp': datetime.datetime.utcnow()
+    #         })
+    # except Exception as e:
+    #     print(f"Error assigning research group: {str(e)}")
+    
+    # Always set to experiment if missing
     try:
         user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
         if 'research_group' not in user_data or not user_data['research_group']:
-            group = random.choice(['experiment', 'control'])
             mongo.db.users.update_one(
                 {'_id': ObjectId(user_id)},
-                {'$set': {'research_group': group}}
+                {'$set': {'research_group': 'experiment'}}
             )
-            # Log the assignment for auditing
-            mongo.db.user_activities.insert_one({
-                'user_id': user_id,
-                'activity': 'group_assignment',
-                'group': group,
-                'timestamp': datetime.datetime.utcnow()
-            })
     except Exception as e:
-        print(f"Error assigning research group: {str(e)}")
-        # Continue even if assignment fails (you can add error response if needed)
-
-    # log it
+        print(f"Error setting research group: {str(e)}")
+    
     _insert_login_log(email, user_id)
-
-    # create JWT
     access_token = create_access_token(identity=user_id, expires_delta=datetime.timedelta(hours=1))
-
-    # --- check previous submissions ---
-    presurvey_submitted = mongo.db.preSurveyAnswers.find_one(
-        {'user_id': user_id}
-    ) is not None
-
-    pq1_submitted = mongo.db.submissions.find_one(
-        {'user_id': user_id, 'question_id': 'programming_q1'}
-    ) is not None
-
-    pq2_submitted = mongo.db.submissions.find_one(
-        {'user_id': user_id, 'question_id': 'programming_q2'}
-    ) is not None
-
+    
+    presurvey_submitted = mongo.db.preSurveyAnswers.find_one({'user_id': user_id}) is not None
+    pq1_submitted = mongo.db.submissions.find_one({'user_id': user_id, 'question_id': 'programming_q1'}) is not None
+    pq2_submitted = mongo.db.submissions.find_one({'user_id': user_id, 'question_id': 'programming_q2'}) is not None
+    
     return jsonify({
         "status": "success",
         "message": "Microsoft login successful!",
@@ -1051,55 +1591,53 @@ def api_login():
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No input data provided"}), 400
-
+    
     email = data.get("email")
     password = data.get("password")
+    
     if not email or not password:
         return jsonify({"status": "error", "message": "Missing email or password"}), 400
-
+    
     user = mongo.db.users.find_one({"email": email})
     if user and bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")):
         user_id = str(user["_id"])
-
-        # Check and assign research group if not set (randomization)
+        
+        # COMMENTED OUT: Random group assignment
+        # try:
+        #     user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        #     if 'research_group' not in user_data or not user_data['research_group']:
+        #         group = random.choice(['experiment', 'control'])
+        #         mongo.db.users.update_one(
+        #             {'_id': ObjectId(user_id)},
+        #             {'$set': {'research_group': group}}
+        #         )
+        #         mongo.db.user_activities.insert_one({
+        #             'user_id': user_id,
+        #             'activity': 'group_assignment',
+        #             'group': group,
+        #             'timestamp': datetime.datetime.utcnow()
+        #         })
+        # except Exception as e:
+        #     print(f"Error assigning research group: {str(e)}")
+        
+        # Always set to experiment
         try:
             user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
             if 'research_group' not in user_data or not user_data['research_group']:
-                group = random.choice(['experiment', 'control'])
                 mongo.db.users.update_one(
                     {'_id': ObjectId(user_id)},
-                    {'$set': {'research_group': group}}
+                    {'$set': {'research_group': 'experiment'}}
                 )
-                # Log the assignment for auditing
-                mongo.db.user_activities.insert_one({
-                    'user_id': user_id,
-                    'activity': 'group_assignment',
-                    'group': group,
-                    'timestamp': datetime.datetime.utcnow()
-                })
         except Exception as e:
-            print(f"Error assigning research group: {str(e)}")
-            # Continue even if assignment fails (you can add error response if needed)
-
-        # log the login
+            print(f"Error setting research group: {str(e)}")
+        
         _insert_login_log(email, user_id)
-
-        # create JWT
         access_token = create_access_token(identity=user_id, expires_delta=datetime.timedelta(days=1))
-
-        # --- check previous submissions ---
-        presurvey_submitted = mongo.db.preSurveyAnswers.find_one(
-            {'user_id': user_id}
-        ) is not None
-
-        pq1_submitted = mongo.db.submissions.find_one(
-            {'user_id': user_id, 'question_id': 'programming_q1'}
-        ) is not None
-
-        pq2_submitted = mongo.db.submissions.find_one(
-            {'user_id': user_id, 'question_id': 'programming_q2'}
-        ) is not None
-
+        
+        presurvey_submitted = mongo.db.preSurveyAnswers.find_one({'user_id': user_id}) is not None
+        pq1_submitted = mongo.db.submissions.find_one({'user_id': user_id, 'question_id': 'programming_q1'}) is not None
+        pq2_submitted = mongo.db.submissions.find_one({'user_id': user_id, 'question_id': 'programming_q2'}) is not None
+        
         return jsonify({
             "status": "success",
             "message": "Login successful!",
@@ -1108,7 +1646,7 @@ def api_login():
                 "id": user_id,
                 "name": user.get("name"),
                 "email": user.get("email"),
-                'research_group': user.get('research_group', 'experiment')
+                'research_group': 'experiment'  # Always experiment
             },
             "presurvey_submitted": presurvey_submitted,
             "programming_q1_submitted": pq1_submitted,
@@ -1117,47 +1655,45 @@ def api_login():
     else:
         return jsonify({"status": "error", "message": "Invalid email or password"}), 401
 
-
 @api_bp.route('/register', methods=['POST'])
 def api_register():
     data = request.get_json()
     if not data:
         return jsonify({'status': 'error', 'message': 'No input data provided'}), 400
-
+    
     name = data.get('name')
     email = data.get('email')
     password = data.get('password')
-
+    
     if not name or not email or not password:
         return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
-
+    
+    # Validate email
+    is_valid, message = is_valid_email(email)
+    if not is_valid:
+        return jsonify({'status': 'error', 'message': message}), 400
+    
     existing_user = mongo.db.users.find_one({'email': email})
     if existing_user:
         return jsonify({'status': 'error', 'message': 'Email already exists. Please login.'}), 400
-
+    
     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
     user = {
         'name': name,
         'email': email,
-        'password': hashed_password.decode('utf-8')
+        'password': hashed_password.decode('utf-8'),
+        'research_group': 'experiment'
     }
     result = mongo.db.users.insert_one(user)
     new_user = mongo.db.users.find_one({'_id': result.inserted_id})
-
-    # NEW: Assign research group randomly during registration
-    group = random.choice(['experiment', 'control'])
-    mongo.db.users.update_one(
-        {'_id': result.inserted_id},
-        {'$set': {'research_group': group}}
-    )
-    # Log the assignment
+    
     mongo.db.user_activities.insert_one({
         'user_id': str(result.inserted_id),
         'activity': 'group_assignment',
-        'group': group,
+        'group': 'experiment',
         'timestamp': datetime.datetime.utcnow()
     })
-
+    
     return jsonify({
         'status': 'success',
         'message': 'Registration successful!',
@@ -1165,7 +1701,7 @@ def api_register():
             'id': str(new_user['_id']),
             'name': new_user['name'],
             'email': new_user['email'],
-            'research_group': group 
+            'research_group': 'experiment'
         }
     }), 201
 
@@ -1184,30 +1720,25 @@ def api_forgot_password():
     if not user:
         return jsonify({'status': 'error', 'message': 'Email not found'}), 404
     
-    # Generate a new password
     new_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
     hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     
-    # Update user's password
     mongo.db.users.update_one(
         {'email': email},
         {'$set': {'password': hashed_password}}
     )
     
-    # Send email with new password
-    msg = Message("Your New Password", 
-                  sender=app.config['MAIL_USERNAME'], 
-                  recipients=[email])
+    msg = Message("Your New Password", sender=app.config['MAIL_USERNAME'], recipients=[email])
     msg.body = f"Your new password is: {new_password}"
     mail.send(msg)
     
     return jsonify({'status': 'success', 'message': 'New password sent to your email'})
 
-    
 @api_bp.route('/presurvey', methods=['GET', 'POST'])
 @jwt_required()
 def api_presurvey():
-    current_user_id = get_jwt_identity()  # This retrieves the user identity stored in the token    
+    current_user_id = get_jwt_identity()
+    
     if request.method == 'GET':
         track_activity_start(current_user_id, 'presurvey')
         questions = list(mongo.db.preSurveyQuestion.find({}, {'_id': 0}))
@@ -1223,33 +1754,12 @@ def api_presurvey():
             'answers': data['answers'],
             'submitted_at': datetime.datetime.now(datetime.timezone.utc)
         }
-
+        
         mongo.db.preSurveyAnswers.insert_one(submission)
         track_activity_end(current_user_id, 'presurvey')
         
         return jsonify({'status': 'success', 'message': 'Survey submitted successfully'})
 
-# autosave code endpoint updated for JWT
-@api_bp.route('/autosave/<page_num>', methods=['POST'])
-@jwt_required()
-def api_autosave_code(page_num):
-    data = request.get_json()
-    code = data.get('code', '')
-    try:
-        user_id = get_jwt_identity()
-        current_time = datetime.datetime.utcnow()
-        autosave_doc = {
-            'user_id': user_id,
-            'question_id': f'programming_q{page_num}',
-            'code': code,
-            'saved_at': current_time
-        }
-        mongo.db.code_autosaves.insert_one(autosave_doc)
-        return jsonify({'status': 'success'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-# programming question endpoint updated for JWT
 @api_bp.route('/question/<page_num>', methods=['GET'])
 @jwt_required()
 def api_programming_question(page_num):
@@ -1261,464 +1771,656 @@ def api_programming_question(page_num):
         if not question:
             return jsonify({'status': 'error', 'message': 'Question not found'}), 404
         
-        # Convert ObjectId fields in test cases if they exist
         if 'test_cases' in question:
             for tc in question['test_cases']:
                 if '_id' in tc:
                     tc['_id'] = str(tc['_id'])
                     
-        return jsonify({
-            'status': 'success',
-            'question': question
-        })
+        return jsonify({'status': 'success', 'question': question})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@api_bp.route('/programming/<page_num>', methods=['GET'])
+@jwt_required()
+def programming_question_api(page_num):
+    try:
+        current_user_id = get_jwt_identity()
+        question_id = f'programming_q{page_num}'
+        
+        track_activity_start(current_user_id, question_id)
+        
+        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
+        if not question:
+            return jsonify({'status': 'error', 'message': 'Programming question not found.'}), 404
+        
+        # Check if multi-file question
+        file_structure = question.get('file_structure')
+        
+        if file_structure and file_structure.get('type') == 'multi-file':
+            # Multi-file mode (C++ only)
+            files = []
+            for file_info in file_structure['files']:
+                filename = file_info['filename']
+                
+                autosaved = mongo.db.code_autosaves.find_one(
+                    {
+                        'user_id': current_user_id,
+                        'question_id': question_id,
+                        'filename': filename
+                    },
+                    sort=[('saved_at', -1)]
+                )
+                
+                if autosaved and autosaved.get('code'):
+                    code = autosaved['code']
+                else:
+                    code = file_info.get('starter_code', '')
+                
+                files.append({
+                    'filename': filename,
+                    'code': code,
+                    'editable': file_info.get('editable', True)
+                })
+            
+            return jsonify({
+                'status': 'success',
+                'question': {
+                    'question_id': question.get('question_id'),
+                    'question_text': question.get('question_text'),
+                    'language': 'cpp',  # Force C++ only
+                    'file_structure': {
+                        'type': 'multi-file',
+                        'files': files
+                    }
+                },
+                'page_num': page_num,
+                'timer_duration': 30
+            })
+        
+        else:
+            # Single file mode (C++ only)
+            code = None
+            autosaved = mongo.db.code_autosaves.find_one(
+                {'user_id': current_user_id, 'question_id': question_id},
+                sort=[('saved_at', -1)]
+            )
+            
+            if autosaved and (autosaved.get('code') or '').strip():
+                code = autosaved['code']
+            else:
+                submitted = mongo.db.submissions.find_one(
+                    {'user_id': current_user_id, 'question_id': question_id}
+                )
+                if submitted and (submitted.get('code') or '').strip():
+                    code = submitted['code']
+                else:
+                    code = question.get('starter_code', '') or ''
+            
+            if isinstance(code, str) and "\\n" in code and "\n" not in code:
+                code = code.replace("\\n", "\n").replace("\\t", "\t")
+            
+            timer_duration = 30
+            
+            return jsonify({
+                'status': 'success',
+                'question': {
+                    'question_id': question.get('question_id'),
+                    'question_text': question.get('question_text'),
+                    'starter_code': question.get('starter_code', '')
+                },
+                'code': code,
+                'page_num': page_num,
+                'timer_duration': timer_duration,
+                'language': 'cpp'  # Force C++ only
+            })
+            
+    except Exception as e:
+        print(f"Error in programming_question: {str(e)}")
+        return jsonify({'status': 'error', 'message': 'Error loading programming question'}), 500
 
-# New routes
 @api_bp.route('/programming/<page_num>/autosave', methods=['POST'])
 @jwt_required()
 def autosave_code(page_num):
     try:
-        code = request.json.get('code')
-        current_time = datetime.datetime.utcnow()
         current_user_id = get_jwt_identity()
+        data = request.json
         
-        autosave_doc = {
-            'user_id': current_user_id,
-            'question_id': f'programming_q{page_num}',
-            'code': code,
-            'saved_at': current_time
-        }
+        # Check if multi-file submission
+        if 'files' in data:
+            # Multi-file autosave
+            for file_data in data['files']:
+                filename = file_data.get('filename')
+                code = file_data.get('code')
+                
+                autosave_doc = {
+                    'user_id': current_user_id,
+                    'question_id': f'programming_q{page_num}',
+                    'filename': filename,
+                    'code': code,
+                    'language': 'cpp',
+                    'saved_at': datetime.datetime.utcnow()
+                }
+                mongo.db.code_autosaves.insert_one(autosave_doc)
+            
+            return jsonify({'status': 'success', 'message': 'All files auto-saved'})
         
-        mongo.db.code_autosaves.insert_one(autosave_doc)
-        
-        return jsonify({'status': 'success', 'message': 'Code auto-saved'})
+        else:
+            # Single file autosave (existing logic)
+            code = data.get('code')
+            language = (data.get('language') or 'cpp').lower()
+            
+            autosave_doc = {
+                'user_id': current_user_id,
+                'question_id': f'programming_q{page_num}',
+                'code': code,
+                'language': language,
+                'saved_at': datetime.datetime.utcnow()
+            }
+            mongo.db.code_autosaves.insert_one(autosave_doc)
+            return jsonify({'status': 'success', 'message': 'Code auto-saved'})
+            
     except Exception as e:
         print(f"Autosave error: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-@api_bp.route('/programming/<page_num>', methods=['GET'])
+@api_bp.route('/programming/<page_num>/run', methods=['POST'])
 @jwt_required()
-def programming_question(page_num):
-    try:
-        current_user_id = get_jwt_identity()
-        user_data = mongo.db.users.find_one({'_id': ObjectId(current_user_id)})
-        group = user_data.get('research_group', 'experiment')  # Fetch from DB
+def programming_run_api(page_num):
+    current_user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    
+    # Check if multi-file submission
+    if 'files' in data:
+        # Multi-file execution (C++ only)
+        files_dict = {f['filename']: f['code'] for f in data['files']}
+        input_data = data.get('input', '')
         
-        question_id = f'programming_q{page_num}'
+        resp = run_cpp_multifile(files_dict, input_data=input_data)
         
-        # Track activity start (errors are caught and logged)
-        try:
-            track_activity_start(current_user_id, question_id)
-        except Exception as tracking_error:
-            print(f"Error tracking activity start: {tracking_error}")
-        
-        # Retrieve the question from MongoDB
-        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
-        if not question:
-            return jsonify({'status': 'error', 'message': 'Programming question not found.'}), 404
-        
-        # Check for autosaved code first, then submitted code, then fallback to starter code
-        autosaved = mongo.db.code_autosaves.find_one({
-            'user_id': current_user_id,
-            'question_id': question_id
-        }, sort=[('saved_at', -1)])
-        
-        if not autosaved:
-            submitted = mongo.db.submissions.find_one({
+        if resp["status"] == "ok":
+            combined = ((resp.get("stdout") or "") + ("\n" + resp.get("stderr") if resp.get("stderr") else "")).strip()
+            
+            mongo.db.run_attempts.insert_one({
                 'user_id': current_user_id,
-                'question_id': question_id
+                'question_id': f'programming_q{page_num}',
+                'files': files_dict,
+                'language': 'cpp',
+                'output': combined,
+                'timestamp': datetime.datetime.utcnow()
             })
-            if submitted and submitted.get('code'):
-                code = submitted.get('code')
-            else:
-                code = question.get('starter_code', '')
+            
+            return jsonify({'status': 'success', 'output': combined, 'language': 'cpp'})
         else:
-            code = autosaved.get('code')
+            err = resp.get("stderr") or resp.get("stdout") or resp.get("status")
+            return jsonify({'status': 'error', 'message': err, 'language': 'cpp'}), 400
+    
+    else:
+        # Single file execution (C++ only)
+        code = data.get('code')
+        language = 'cpp'  # Force C++ only
+        input_data = data.get('input', '')
         
-        # Set timer duration based on page number
-        if page_num == '1':
-            timer_duration = 20  # 20 minutes for question 1
-        elif page_num == '2':
-            timer_duration = 30  # 30 minutes for question 2
+        if not code.strip():
+            return jsonify({'status': 'error', 'message': 'Code is required'}), 400
+        
+        resp = run_cpp_once(code, input_data=input_data)
+        
+        if resp["status"] == "ok":
+            combined = ((resp.get("stdout") or "") + ("\n" + resp.get("stderr") if resp.get("stderr") else "")).strip()
+            
+            mongo.db.run_attempts.insert_one({
+                'user_id': current_user_id,
+                'question_id': f'programming_q{page_num}',
+                'code': code,
+                'language': language,
+                'output': combined,
+                'timestamp': datetime.datetime.utcnow()
+            })
+            
+            return jsonify({'status': 'success', 'output': combined, 'language': language})
         else:
-            timer_duration = 30  # Default is 30 minutes
+            err = resp.get("stderr") or resp.get("stdout") or resp.get("status")
+            return jsonify({'status': 'error', 'message': err, 'language': language}), 400
+
+@api_bp.route('/programming/<page_num>/submit', methods=['POST'])
+@jwt_required()
+def programming_submit_api(page_num):
+    current_user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    
+    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+    if not question:
+        return jsonify({'status': 'error', 'message': 'Question not found'}), 404
+    
+    # Check if multi-file submission
+    if 'files' in data:
+        files_dict = {f['filename']: f['code'] for f in data['files']}
+        test_cases = question.get('test_cases', [])
         
-        response = {
-            'status': 'success',
-            'question': question,
-            'code': code,
-            'page_num': page_num,
-            'timer_duration': timer_duration,
-            'ai_mode': 'free' if group == 'control' else 'srl'
+        test_results = run_code_with_test_cases_multifile('cpp', files_dict, test_cases)
+        
+        total_tests = len(test_results)
+        passed_tests = sum(1 for r in test_results if r.get('status') == 'passed')
+        score = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
+        passed_all = (passed_tests == total_tests) and total_tests > 0
+        
+        submission = {
+            'user_id': current_user_id,
+            'question_id': f'programming_q{page_num}',
+            'language': 'cpp',
+            'files': files_dict,
+            'test_results': test_results,
+            'score': score,
+            'timestamp': datetime.datetime.now(datetime.timezone.utc)
         }
         
-        if group == 'experiment':
-            # Provide SRL prompts for control group
-            srl_prompts = [
-                "What is your learning goal for this programming task?",
-                "How do you plan to approach solving this problem?",
-                "What strategies will you use to test and debug your code?",
-                "Reflect on any errors: What caused them and how can you fix them?",
-                "How does this task relate to what you've learned before?"
-            ]  # Or fetch from DB
-            response['srl_prompts'] = srl_prompts
+        mongo.db.submissions.update_one(
+            {'user_id': current_user_id, 'question_id': f'programming_q{page_num}'},
+            {'$set': submission},
+            upsert=True
+        )
         
-        return jsonify(response)
-    except Exception as e:
-        print(f"Error in programming_question: {str(e)}")
-        return jsonify({'status': 'error', 'message': 'Error loading programming question'}), 500
+        track_user_success(current_user_id, f'programming_q{page_num}', passed_all, score, test_results)
+        track_activity_end(current_user_id, f'programming_q{page_num}')
+        
+        # ✅ ALWAYS GO TO POST-SURVEY (SINGLE QUESTION STUDY)
+        return jsonify({
+            'status': 'success',
+            'message': 'Submission saved',
+            'score': score,
+            'test_results': test_results,
+            'passed_all_tests': passed_all,
+            'next_action': 'postsurvey'
+        })
+    
+    else:
+        # Single file submission (C++ only)
+        code = data.get('code')
+        language = 'cpp'
+        
+        if not code:
+            return jsonify({'status': 'error', 'message': 'No code provided'}), 400
+        
+        test_cases = question.get('test_cases', [])
+        test_results = run_code_with_test_cases_multi(language, code, test_cases)
+        
+        total_tests = len(test_results)
+        passed_tests = sum(1 for r in test_results if r.get('status') == 'passed')
+        score = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
+        passed_all = (passed_tests == total_tests) and total_tests > 0
+        
+        submission = {
+            'user_id': current_user_id,
+            'question_id': f'programming_q{page_num}',
+            'language': language,
+            'code': code,
+            'test_results': test_results,
+            'score': score,
+            'timestamp': datetime.datetime.now(datetime.timezone.utc)
+        }
+        
+        mongo.db.submissions.update_one(
+            {'user_id': current_user_id, 'question_id': f'programming_q{page_num}'},
+            {'$set': submission},
+            upsert=True
+        )
+        
+        track_user_success(current_user_id, f'programming_q{page_num}', passed_all, score, test_results)
+        track_activity_end(current_user_id, f'programming_q{page_num}')
+        
+        # ✅ ALWAYS GO TO POST-SURVEY (SINGLE QUESTION STUDY)
+        return jsonify({
+            'status': 'success',
+            'message': 'Submission saved',
+            'score': score,
+            'test_results': test_results,
+            'passed_all_tests': passed_all,
+            'next_action': 'postsurvey'
+        })
+
 
 @api_bp.route('/programming/<page_num>/prompt', methods=['POST'])
 @jwt_required()
-def programming_prompt(page_num):
+def programming_prompt_api(page_num):
+    """Natural SRL-based conversational AI - Always enabled"""
     current_user_id = get_jwt_identity()
-    user_data = mongo.db.users.find_one({'_id': ObjectId(current_user_id)})
-    group = user_data.get('research_group', 'experiment')
-
+    
     data = request.get_json()
-    prompt = data.get('prompt')
+    prompt = data.get('prompt', '')
     code = data.get('code', '')
-
-    if not prompt:
-        return jsonify({'status': 'error', 'message': 'Prompt is required'}), 400
-
+    terminal_output = data.get('terminal_output', '')
+    hide_user_prompt = data.get('hide_user_prompt', False)  
+    
     try:
         question_id = f'programming_q{page_num}'
         question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
-        question_text = question.get('question_text', 'No question text available.') if question else 'No question text available.'
-
+        question_text = question.get('question_text', '') if question else ''
+        
         latest_run = mongo.db.run_attempts.find_one(
             {'user_id': current_user_id, 'question_id': question_id},
             sort=[('timestamp', -1)]
         )
-        latest_test_results = ""
-        if latest_run:
-            if 'test_results' in latest_run:
-                latest_test_results = format_test_results(latest_run['test_results'])
-            elif 'output' in latest_run:
-                latest_test_results = latest_run['output']
-
-        # Load or initialize conversation history
+        latest_test_results = format_test_results(latest_run.get('test_results', [])) if latest_run else ""
+        
+        if not terminal_output and latest_test_results:
+            terminal_output = latest_test_results
+        
+        srl_state = SRLConversationManager.get_or_create_state(current_user_id, question_id)
+        
         conversation = mongo.db.conversations.find_one({
             'user_id': current_user_id,
             'question_id': question_id
         })
         history = conversation.get('history', []) if conversation else []
-
-        # ----- Different system prompts depending on group -----
-        if group == 'control':
-            # Free AI assistant mode
-            system_content = (
-                f"You are a helpful programming assistant.\n"
-                f"Programming task: {question_text}\n"
-                f"Current code in editor: {code}\n"
-                f"Latest terminal outputs/test results: {latest_test_results or 'No previous runs.'}"
-            )
-            user_message = prompt
-        else:
-            # SRL (planning / monitoring / reflection) mode
-            system_content = (
-                f"You are a programming learning companion.\n"
-                f"Student is solving: {question_text}\n"
-                f"Current code: {code}\n"
-                f"Latest results: {latest_test_results or 'No previous runs.'}\n\n"
-                f"Encourage self-regulated learning (planning, monitoring, reflection)."
-            )
-            user_message = f"Student reflection: {prompt}"
-
-        # Build messages
-        messages = [{"role": "system", "content": system_content}] + history + [{"role": "user", "content": user_message}]
-
-        # Call OpenAI
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=0.7
+        
+        current_step_info = {
+            'step_number': srl_state.get('step_number', 0),
+            'total_steps': srl_state.get('total_steps', 3),
+            'step_name': srl_state.get('current_step_name', 'Getting started')
+        }
+        
+        system_prompt = build_natural_srl_prompt(
+            question_text, code, terminal_output, history, current_step_info
         )
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        for msg in history[-8:]:
+            messages.append({"role": msg['role'], "content": msg['content']})
+        
+        messages.append({"role": "user", "content": prompt})
+        
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=600
+        )
+        
         ai_response = response.choices[0].message.content
-
-        # Update history
-        history.append({"role": "user", "content": user_message})
+        
+        detected_phase = detect_srl_phase_from_conversation(
+            ai_response, prompt, code, terminal_output, srl_state.get('phase', 'PLANNING')
+        )
+        
+        step_match = re.search(r'Step (\d+)', ai_response)
+        if step_match:
+            step_num = int(step_match.group(1))
+            if step_num > current_step_info['step_number']:
+                current_step_info['step_number'] = step_num
+        
+       
+        if not hide_user_prompt:
+            history.append({"role": "user", "content": prompt})
+        
+        # ✅ Always save AI response
         history.append({"role": "assistant", "content": ai_response})
+        
+        SRLConversationManager.update_state(current_user_id, question_id, {
+            'interaction_count': srl_state.get('interaction_count', 0) + 1,
+            'phase': detected_phase,
+            'step_number': current_step_info['step_number']
+        })
+        
         mongo.db.conversations.update_one(
             {'user_id': current_user_id, 'question_id': question_id},
             {'$set': {'history': history}},
             upsert=True
         )
-
-        # Log interaction
+        
         mongo.db.ai_interactions.insert_one({
             'user_id': current_user_id,
             'question_id': question_id,
-            'group': group,
-            'prompt': prompt,
+            'group': 'experiment',
+            'phase': detected_phase,
+            'prompt': '[AUTO_START]' if hide_user_prompt else prompt,
             'ai_response': ai_response,
+            'code_length': len(code) if code else 0,
+            'has_output': bool(terminal_output),
             'timestamp': datetime.datetime.utcnow()
         })
-
-    except Exception as e:
-        ai_response = f"Error: {str(e)}"
-
-    return jsonify({
-        'question_id': f'programming_q{page_num}',
-        'prompt': prompt,
-        'code': code,
-        'ai_response': ai_response
-    })
-
-
-
-@api_bp.route('/programming/<page_num>/run', methods=['POST'])
-@jwt_required()
-def programming_run(page_num):
-    current_user_id = get_jwt_identity()
-    data = request.get_json()  
-    code = data.get('code')
- 
-    if not code:
-        return jsonify({'status': 'error', 'message': 'Code is required'}), 400
- 
-    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
-    if not question:
-        return jsonify({'status': 'error', 'message': 'Question not found'}), 404
- 
-    # Run the user-submitted code
-    output = run_code_simple(code)
- 
-    # Save the code and output to MongoDB
-    mongo.db.run_attempts.insert_one({
-        'user_id': current_user_id,
-        'question_id': f'programming_q{page_num}',
-        'code': code,
-        'output': output,
-        'timestamp': datetime.datetime.utcnow()
-    })
- 
-    # Return response with output
-    return jsonify({
-        'status': 'success',
-        'question': {
-            'title': question.get('title'),
-            'description': question.get('description'),
-            'question_id': question.get('question_id')
-        },
-        'code': code,
-        'output': output,
-        'page_num': page_num
-    })
- 
- 
-# Modified programming submit route with login_sequence check
-@api_bp.route('/programming/<page_num>/submit', methods=['POST'])
-@jwt_required()
-def programming_submit(page_num):
-    current_user_id = get_jwt_identity()
-    data = request.get_json()  # Expecting JSON body with key 'code'
-    code = data.get('code')
-
-    if not code:
-        return jsonify({'status': 'error', 'message': 'No code provided'}), 400
-
-    question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
-    if not question:
-        return jsonify({'status': 'error', 'message': 'Question not found'}), 404
-
-    # Run tests and calculate score
-    test_cases = question.get('test_cases', [])
-    test_results = run_code_with_test_cases(code, test_cases)
-    total_tests = len(test_results)
-    passed_tests = sum(1 for result in test_results if result.get('status') == 'passed')
-    score = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
-
-    submission = {
-        'user_id': current_user_id,
-        'question_id': f'programming_q{page_num}',
-        'code': code,
-        'test_results': test_results,
-        'score': score,
-        'timestamp': datetime.datetime.now(datetime.timezone.utc)
-    }
-
-    # Save submission using upsert
-    mongo.db.submissions.update_one(
-        {
-            'user_id': current_user_id,
-            'question_id': f'programming_q{page_num}'
-        },
-        {'$set': submission},
-        upsert=True
-    )
-
-    track_activity_end(current_user_id, f'programming_q{page_num}')
-
-    # Fetch the most recent login_log for this user
-    last_log = mongo.db.login_logs.find_one(
-        {'user_id': current_user_id},
-        sort=[('login_sequence', -1)]
-    )
-
-    if last_log and (last_log['login_sequence'] % 2 == 1):
-        # If login_sequence is odd, direct to programming question 2
+        
         return jsonify({
             'status': 'success',
-            'message': 'Submission saved. Please proceed to programming question 2.'
+            'ai_response': ai_response,
+            'phase': detected_phase,
+            'step_info': current_step_info
+        })
+        
+    except Exception as e:
+        print(f"Error in programming_prompt: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'message': f'Error: {str(e)}'}), 500
+
+
+
+
+@api_bp.route('/programming/<page_num>/feedback', methods=['POST'])
+@jwt_required()
+def log_feedback(page_num):
+    """Log thumbs up/down feedback"""
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    helpful = data.get('helpful', None)
+    phase = data.get('phase', 'Unknown')
+    message_index = data.get('message_index', -1)
+    message_content = data.get('message_content', '')
+    
+    try:
+        question_id = f'programming_q{page_num}'
+        
+        mongo.db.user_feedback.insert_one({
+            'user_id': current_user_id,
+            'question_id': question_id,
+            'phase': phase,
+            'helpful': helpful,
+            'message_index': message_index,
+            'message_content': message_content[:200],
+            'timestamp': datetime.datetime.utcnow()
+        })
+        
+        return jsonify({'status': 'success', 'message': 'Feedback recorded'})
+        
+    except Exception as e:
+        print(f"Error logging feedback: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@api_bp.route('/programming/<page_num>/conversation_state', methods=['GET'])
+@jwt_required()
+def get_conversation_state(page_num):
+    """Get current conversation state"""
+    current_user_id = get_jwt_identity()
+    question_id = f'programming_q{page_num}'
+    
+    try:
+        srl_state = SRLConversationManager.get_or_create_state(current_user_id, question_id)
+        
+        conversation = mongo.db.conversations.find_one({
+            'user_id': current_user_id,
+            'question_id': question_id
+        })
+        
+        return jsonify({
+            'status': 'success',
+            'phase': srl_state.get('phase', 'PLANNING'),
+            'step_info': {
+                'current': srl_state.get('step_number', 0),
+                'total': srl_state.get('total_steps', 3),
+                'step_name': srl_state.get('current_step_name', '')
+            },
+            'conversation_history': conversation.get('history', []) if conversation else [],
+            'interaction_count': srl_state.get('interaction_count', 0)
+        })
+        
+    except Exception as e:
+        print(f"Error getting conversation state: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@api_bp.route('/programming/<page_num>/detect_phase', methods=['POST'])
+@jwt_required()
+def detect_srl_phase(page_num):
+    """Intelligent SRL phase detection based on user's prompt"""
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    user_prompt = data.get('prompt', '')
+    code = data.get('code', '')
+    terminal_output = data.get('terminal_output', '')
+    
+    if not user_prompt.strip():
+        return jsonify({'status': 'error', 'message': 'Prompt is required'}), 400
+    
+    try:
+        question_id = f'programming_q{page_num}'
+        question = mongo.db.programmingQuestions.find_one({'question_id': question_id})
+        question_text = question.get('question_text', 'No question available') if question else 'No question available'
+        
+        detection_prompt = f"""You are an expert educational AI that detects which Self-Regulated Learning (SRL) phase a student is in based on their question.
+
+Analyze the student's question and determine which phase they're in:
+
+**PLANNING Phase** - Student is:
+- Asking "what is", "how do I", "explain", "syntax"
+- Learning new concepts before coding
+- Asking about structure, approach, or starting point
+
+**MONITORING Phase** - Student is:
+- Saying "stuck", "error", "not working", "bug", "crashes"
+- Debugging active code
+- Has written code but it's not working correctly
+
+**REFLECTION Phase** - Student is:
+- Saying "finished", "done", "completed", "works"
+- Asking "how can I improve", "is this efficient"
+- Reviewing completed code
+
+**Student's question:** "{user_prompt}"
+**Context:**
+- Programming task: {question_text}
+- Current code: {code if code.strip() else 'No code written yet'}
+- Terminal output: {terminal_output if terminal_output.strip() else 'No output yet'}
+
+**Your response must be EXACTLY in this JSON format:**
+{{
+    "phase": "Planning" or "Monitoring" or "Reflection",
+    "confidence": "high" or "medium" or "low",
+    "explanation": "One sentence explaining why"
+}}
+
+Respond ONLY with valid JSON, nothing else."""
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an expert in Self-Regulated Learning theory. Always respond with valid JSON only."},
+                {"role": "user", "content": detection_prompt}
+            ],
+            temperature=0.3,
+        )
+        
+        ai_response = response.choices[0].message.content.strip()
+        
+        try:
+            if ai_response.startswith('```'):
+                ai_response = ai_response.split('```')[1]
+                if ai_response.startswith('json'):
+                    ai_response = ai_response[4:]
+            
+            detection_result = json.loads(ai_response)
+            detected_phase = detection_result.get('phase', 'Planning')
+            confidence = detection_result.get('confidence', 'medium')
+            
+        except json.JSONDecodeError:
+            user_prompt_lower = user_prompt.lower()
+            
+            planning_keywords = ['what', 'how', 'syntax', 'explain', 'start', 'begin', 'understand']
+            monitoring_keywords = ['error', 'bug', 'stuck', 'not working', 'crash', 'wrong', 'issue']
+            reflection_keywords = ['improve', 'better', 'optimize', 'efficient', 'finished', 'done', 'works']
+            
+            planning_score = sum(1 for keyword in planning_keywords if keyword in user_prompt_lower)
+            monitoring_score = sum(1 for keyword in monitoring_keywords if keyword in user_prompt_lower)
+            reflection_score = sum(1 for keyword in reflection_keywords if keyword in user_prompt_lower)
+            
+            if monitoring_score > planning_score and monitoring_score > reflection_score:
+                detected_phase = 'Monitoring'
+            elif reflection_score > planning_score and reflection_score > monitoring_score:
+                detected_phase = 'Reflection'
+            else:
+                detected_phase = 'Planning'
+            
+            confidence = 'medium'
+        
+        phase_explanation = f"Based on your question, I can see you're in the **{detected_phase}** phase.\n\n"
+        
+        if detected_phase == 'Planning':
+            phase_explanation += "This means you're working on understanding concepts and planning your approach. Let me help you build a strong foundation!"
+        elif detected_phase == 'Monitoring':
+            phase_explanation += "This means you're actively working on your code and need help tracking your progress. Let me help you get unstuck!"
+        else:
+            phase_explanation += "This means you're reviewing your work and thinking about improvements. Let me help you reflect on what you've accomplished!"
+        
+        mongo.db.phase_detections.insert_one({
+            'user_id': current_user_id,
+            'question_id': question_id,
+            'user_prompt': user_prompt,
+            'detected_phase': detected_phase,
+            'confidence': confidence,
+            'timestamp': datetime.datetime.utcnow()
+        })
+        
+        return jsonify({
+            'status': 'success',
+            'detected_phase': detected_phase,
+            'confidence': confidence,
+            'phase_explanation': phase_explanation
+        })
+        
+    except Exception as e:
+        print(f"Error in phase detection: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'status': 'success',
+            'detected_phase': 'Planning',
+            'confidence': 'low',
+            'phase_explanation': "Let me help you with planning."
         })
 
-    # Otherwise, use the existing page-based logic (updated: no feedback mention)
-    if page_num == '2':
-        return jsonify({'status': 'success', 'message': 'Submission saved. Please proceed to postsurvey.'})
-    else:
-        return jsonify({'status': 'success', 'message': 'Submission saved. Proceed to next question.'})
+@api_bp.route('/programming/<page_num>/confidence', methods=['POST'])
+@jwt_required()
+def record_confidence_rating(page_num):
+    """Record student confidence during monitoring phase"""
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
     
+    rating = data.get('rating')
+    step_number = data.get('step_number')
+    
+    if not rating:
+        return jsonify({'status': 'error', 'message': 'Rating is required'}), 400
+    
+    try:
+        question_id = f'programming_q{page_num}'
+        srl_state = SRLConversationManager.get_or_create_state(current_user_id, question_id)
+        
+        confidence_ratings = srl_state.get('confidence_ratings', [])
+        confidence_ratings.append({
+            'rating': int(rating),
+            'step': step_number or srl_state['step_number'],
+            'timestamp': datetime.datetime.utcnow()
+        })
+        
+        SRLConversationManager.update_state(current_user_id, question_id, {
+            'confidence_ratings': confidence_ratings
+        })
+        
+        return jsonify({'status': 'success', 'message': 'Confidence recorded'})
+        
+    except Exception as e:
+        print(f"Error recording confidence: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/debug/conversations/<user_id>/<question_id>', methods=['GET'])
-@login_required  
-def debug_conversations(user_id, question_id):
-    conversation = mongo.db.conversations.find_one({
-        'user_id': user_id,
-        'question_id': question_id
-    })
-    if conversation:
-        return jsonify(conversation['history'])
-    else:
-        return jsonify({'message': 'No conversation found'}), 404
-
-# @api_bp.route('/feedback/<question_id>', methods=['GET'])
-# @jwt_required()
-# def api_feedback(question_id):
-#     try:
-#         question_id = f'programming_q{question_id}'
-#         user_id = get_jwt_identity()  # Get the user ID from the JWT
-#         user_data = mongo.db.users.find_one({'_id': ObjectId(user_id)})
-#         group = user_data.get('research_group', 'experiment')
-#         print(user_id)
-#         # Count AI interactions for this user and question
-#         personal_usage_count = mongo.db.ai_interactions.count_documents({
-#             'user_id': user_id,
-#             'question_id': question_id
-#         })
-#         
-#         # Determine usage percentage
-#         usage_percentage = 0 if personal_usage_count == 0 else random.randint(40, 90)
-#         
-#         # Get the most recent activity record for this question
-#         activity_record = mongo.db.user_activities.find_one({
-#             'user_id': user_id,
-#             'activity': question_id,
-#             'end_time': {'$ne': None}
-#         }, sort=[('end_time', -1)])
-#         
-#         if activity_record and activity_record.get('start_time') and activity_record.get('end_time'):
-#             start_time = activity_record['start_time']
-#             end_time = activity_record['end_time']
-#         else:
-#             # Fallback: check submission timestamp
-#             submission = mongo.db.submissions.find_one({
-#                 'user_id': user_id,
-#                 'question_id': question_id
-#             })
-#             
-#             if submission and submission.get('timestamp'):
-#                 end_time = submission['timestamp']
-#                 duration = 20 if question_id == 'programming_q1' else 30
-#                 start_time = end_time - datetime.timedelta(minutes=duration)
-#             else:
-#                 # Final fallback: use AI interactions or default times
-#                 interactions = list(mongo.db.ai_interactions.find({
-#                     'user_id': user_id,
-#                     'question_id': question_id
-#                 }).sort('timestamp', 1))
-#                 
-#                 if interactions:
-#                     start_time = interactions[0]['timestamp']
-#                     end_time = interactions[-1]['timestamp']
-#                     if (end_time - start_time).total_seconds() < 600:
-#                         end_time = start_time + datetime.timedelta(minutes=10)
-#                 else:
-#                     end_time = datetime.datetime.utcnow()
-#                     start_time = end_time - datetime.timedelta(minutes=20)
-#         
-#         # Ensure a minimum session duration
-#         min_duration = 20 if question_id == 'programming_q1' else 30
-#         total_duration = max(min_duration, (end_time - start_time).total_seconds() / 60)
-#         total_duration_rounded = math.ceil(total_duration / 2) * 2  # Rounded up to nearest 2 minutes
-#         
-#         # Create 2-minute intervals and count interactions for each
-#         time_intervals = []
-#         interval_counts = []
-#         for minute in range(2, int(total_duration_rounded) + 1, 2):
-#             time_intervals.append(str(minute))
-#             interval_start = start_time + datetime.timedelta(minutes=minute-2)
-#             interval_end = start_time + datetime.timedelta(minutes=minute)
-#             count = mongo.db.ai_interactions.count_documents({
-#                 'user_id': user_id,
-#                 'question_id': question_id,
-#                 'timestamp': {
-#                     '$gte': interval_start,
-#                     '$lt': interval_end
-#                 }
-#             })
-#             interval_counts.append(count)
-#         
-#         time_data = {
-#             'labels': time_intervals,
-#             'values': interval_counts
-#         }
-#         
-#         # Determine next step based on question_id
-#         page_num = question_id.replace('programming_q', '')
-#         if page_num == '1':
-#             next_page_num = '2'
-#             next_url = url_for('programming_question', page_num=next_page_num)
-#         else:
-#             next_page_num = 'survey'
-#             next_url = url_for('api_postsurvey')
-#         
-#         # Prepare feedback data
-#         feedback_data = {
-#             'user_id': user_id,
-#             'question_id': question_id,
-#             'timestamp': datetime.datetime.now(datetime.UTC),
-#             'personal_usage_count': personal_usage_count,
-#             'usage_percentage': usage_percentage,
-#             'time_data': time_data,
-#             'session_start': start_time,
-#             'session_end': end_time,
-#             'session_duration_minutes': total_duration
-#         }
-#         
-#         if group == 'control':
-#             feedback_data['personal_usage_count'] = 0
-#             feedback_data['usage_percentage'] = 0
-#         
-#         # Save feedback data with upsert
-#         mongo.db.feedback.update_one(
-#             {'user_id': user_id, 'question_id': question_id},
-#             {'$set': feedback_data},
-#             upsert=True
-#         )
-#         
-#         # Return feedback information as JSON
-#         return jsonify({
-#             'status': 'success',
-#             'feedback': feedback_data,
-#             'next': {
-#                 'page_num': next_page_num,
-#                 'url': next_url
-#             }
-#         })
-#     
-#     except Exception as e:
-#         print(f"Error in feedback route: {str(e)}")
-#         traceback.print_exc()
-#         return jsonify({'status': 'error', 'message': 'Error loading feedback data'}), 500
-
-# ------------------------------
-# API Route for Post-Survey
-# ------------------------------
 @api_bp.route('/postSurvey', methods=['GET', 'POST'])
 @jwt_required()
 def api_postsurvey():
@@ -1728,7 +2430,6 @@ def api_postsurvey():
         track_activity_start(user_id, 'postsurvey')
         questions = list(mongo.db.postSurveyQuestion.find({}))
         for question in questions:
-            # If using PyMongo, question['_id'] is usually an ObjectId so str() converts it properly.
             question['id'] = str(question['_id'])
             del question['_id']
         return jsonify({'questions': questions})
@@ -1739,7 +2440,6 @@ def api_postsurvey():
             if not data:
                 return jsonify({'status': 'error', 'message': 'No data provided'}), 400
             
-            # Retrieve questions to validate answers
             questions = list(mongo.db.postSurveyQuestion.find())
             answers = {}
             
@@ -1750,18 +2450,17 @@ def api_postsurvey():
                     answers[key] = answer
             
             if len(answers) != len(questions):
-                return jsonify({'status': 'error', 'message': 'Please answer all questions', 'answers_received': answers}), 400
+                return jsonify({'status': 'error', 'message': 'Please answer all questions'}), 400
             
             submission = {
                 'user_id': user_id,
                 'answers': answers,
                 'submitted_at': datetime.datetime.now(datetime.timezone.utc)
             }
-
+            
             mongo.db.postSurveyAnswers.insert_one(submission)
             track_activity_end(user_id, 'postsurvey')
-
-            # Update user status as complete
+            
             mongo.db.users.update_one(
                 {'_id': ObjectId(user_id)},
                 {'$set': {'completed': True, 'completion_date': datetime.datetime.now(datetime.timezone.utc)}}
@@ -1772,17 +2471,13 @@ def api_postsurvey():
         except Exception as e:
             print("Error in postSurvey:", str(e))
             traceback.print_exc()
-            return jsonify({'status': 'error', 'message': 'An error occurred while submitting the survey'}), 500
+            return jsonify({'status': 'error', 'message': 'An error occurred'}), 500
 
-# ------------------------------
-# API Route for Completion Page
-# ------------------------------
 @api_bp.route('/completion', methods=['GET'])
 @jwt_required()
 def api_completion():
     try:
         user_id = get_jwt_identity()
-        # Retrieve additional user info if necessary (e.g. name)
         user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
         user_name = user.get('name') if user else 'User'
         now = datetime.datetime.now()
@@ -1794,72 +2489,48 @@ def api_completion():
                 'timestamp': now.isoformat()
             }
         })
-    
     except Exception as e:
         print("Error in completion route:", str(e))
         traceback.print_exc()
         return jsonify({'status': 'error', 'message': 'Could not load completion data'}), 500
 
-
-
 @api_bp.route('/run_code_raw', methods=['POST'])
 @jwt_required()
 def run_code_raw():
     try:
-        current_user_id = get_jwt_identity()
-        data = request.get_json()  # Expecting JSON body with key 'code'
+        data = request.get_json()
         code = data.get('code')
+        
         if not code.strip():
             return jsonify({'status': 'error', 'message': 'Code is empty'}), 400
-
+        
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
             f.write(code)
             temp_file = f.name
-
-        # Run the code using subprocess
+        
         process = subprocess.Popen(
             ['python3', temp_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
+        
         stdout, stderr = process.communicate(timeout=10)
-
-        # Clean up the temp file
         os.unlink(temp_file)
-
+        
         return jsonify({
             'status': 'success',
             'stdout': stdout.strip(),
             'stderr': stderr.strip()
         })
-
     except subprocess.TimeoutExpired:
-        return jsonify({
-            'status': 'error',
-            'stderr': 'Execution timed out (10 seconds)'
-        }), 500
+        return jsonify({'status': 'error', 'stderr': 'Execution timed out (10 seconds)'}), 500
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'stderr': str(e)
-        }), 500
+        return jsonify({'status': 'error', 'stderr': str(e)}), 500
 
-
-def run_code_simple(code):
-    try:
-        old_stdout = sys.stdout
-        redirected_output = sys.stdout = io.StringIO()
-        exec(code, {})  
-        output = redirected_output.getvalue()
-    except Exception:
-        output = traceback.format_exc()
-    finally:
-        sys.stdout = old_stdout
-    return output
-
-
+# Register blueprint
 app.register_blueprint(api_bp, url_prefix='/api')
 
+# Run application
 if __name__ == '__main__':
-   app.run(debug=True)
+    app.run(host='0.0.0.0', port=3001, debug=True)

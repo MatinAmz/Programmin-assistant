@@ -43,8 +43,8 @@
                     <v-radio
                       v-for="(option, optIndex) in question.options"
                       :key="optIndex"
-                      :label="option"
-                      :value="option"
+                      :label="getOptionLabel(option)"
+                      :value="getOptionValue(option)"
                     ></v-radio>
                   </v-radio-group>
 
@@ -78,12 +78,12 @@
                           answers[question.id].length === 0)
                     }"
                   >
-                    <div class="mb-4">{{ question.question_text }}</div>
+                    <div class="question-text">{{ question.question_text }}</div>
                     <v-checkbox
                       v-for="(option, optIndex) in question.options"
                       :key="optIndex"
-                      :label="option.label"
-                      :value="option.value"
+                      :label="getOptionLabel(option)"
+                      :value="getOptionValue(option)"
                       v-model="answers[question.id]"
                       color="primary"
                       hide-details="true"
@@ -96,60 +96,46 @@
                   <h2 class="text-h6 mb-4">
                     Please select your answer for each statement:
                   </h2>
-                  <!-- Wrapping table in a scrollable container -->
                   <div class="scrollable-table">
                     <v-simple-table class="likert-table">
                       <template v-slot:default>
                         <thead>
                           <tr>
-                            <!-- The first column now auto‐sizes to its content -->
                             <th class="table-cell">Question</th>
                             <th
                               v-for="(option, idx) in likertOptions"
                               :key="idx"
                               class="table-cell text-center"
                             >
-                              {{ option }}
+                              {{ getOptionLabel(option) }}
                             </th>
                           </tr>
                         </thead>
                         <tbody>
                           <tr
-                            v-for="question in likertQuestions"
-                            :key="question.id"
-                            :class="{
-                              'input-error':
-                                submittedOnce &&
-                                question.required &&
-                                (!answers[question.id] ||
-                                  answers[question.id].toString().trim() === '')
-                            }"
+                            v-for="q in likertQuestions"
+                            :key="q.id"
                             class="table-row"
                           >
-                            <td class="table-cell" style="white-space: normal;">
-                              {{ question.question_text }}
+                            <td class="table-cell">
+                              {{ q.question_text }}
                             </td>
                             <td
-                              v-for="(option, optIndex) in question.options"
+                              v-for="(option, optIndex) in likertOptions"
                               :key="optIndex"
                               class="table-cell text-center"
                             >
-                              <!-- Likert radio buttons wrapped in a radio group -->
                               <v-radio-group
-                                v-model="answers[question.id]"
+                                v-model="answers[q.id]"
                                 row
                                 hide-details="true"
-                                :error="
-                                  submittedOnce &&
-                                  question.required &&
-                                  (!answers[question.id] ||
-                                    answers[question.id].toString().trim() === '')
-                                "
+                                :error="submittedOnce && q.required && !answers[q.id]"
                                 class="d-flex justify-center"
                               >
                                 <v-radio
-                                  :value="option"
+                                  :value="getOptionValue(option)"
                                   class="d-flex justify-center"
+                                  :label="''"
                                 ></v-radio>
                               </v-radio-group>
                             </td>
@@ -160,7 +146,7 @@
                   </div>
                 </div>
 
-                <!-- Submit Button (always clickable) -->
+                <!-- Submit Button -->
                 <div class="d-flex justify-center">
                   <v-btn
                     type="button"
@@ -251,6 +237,14 @@ export default {
       if (parts.length === 2) return parts.pop().split(';').shift();
       return null;
     },
+    getOptionLabel(option) {
+      return typeof option === 'string' ? option : option?.label ?? '';
+    },
+    getOptionValue(option) {
+      return typeof option === 'string'
+        ? option
+        : option?.value ?? option?.label ?? '';
+    },
     async fetchQuestions() {
       try {
         const token = this.getAccessToken();
@@ -319,35 +313,28 @@ export default {
   margin: 20px;
 }
 .question-divider {
-  padding-bottom: 10px;
+  padding: 10px 10px 10px 20px;
   margin-bottom: 10px;
   border-bottom: 1px solid grey;
+  font-size: 16px;
 }
 
-/* Make the first (Question) column auto‐width to fit its content */
-.likert-table {
-  table-layout: auto;     /* allow columns to size by content */
-  width: 100%;
-}
-.likert-table th:first-child,
-.likert-table td:first-child {
-  white-space: nowrap;     /* keep question text on one line, or remove if you want wrapping */
-  width: fit-content;      /* shrink to fit the longest question */
+.question-text {
+  font-size: 16px;
+  margin-bottom: 8px;
 }
 
-/* The other columns will take remaining space evenly */
-.likert-table th:not(:first-child),
-.likert-table td:not(:first-child) {
-  width: auto;
-}
-
+/* Likert table adjustments for uniform padding and font sizes */
 .likert-table .table-cell {
   border: 1px solid #dedede;
-  padding: 8px;
+  padding: 8px 8px 8px 20px;
+  font-size: 16px;
 }
+
 .likert-table th.table-cell {
   background-color: #f5f5f5;
 }
+
 .likert-table .table-row {
   border: 1px solid #f5f5f5;
 }
@@ -355,13 +342,14 @@ export default {
 .rounded-card {
   border-radius: 12px;
 }
-.input-error {
-  border: 2px solid red;
-  border-radius: 4px;
-  padding: 4px;
-}
-/* Scrollable table container for responsiveness */
+
 .scrollable-table {
   overflow-x: auto;
+}
+
+.input-error {
+  border: 2px solid #dd2d4a;
+  border-radius: 6px;
+  padding: 4px;
 }
 </style>

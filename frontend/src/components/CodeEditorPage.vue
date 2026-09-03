@@ -85,7 +85,26 @@
               </v-chip>
             </div>
  
-            <!-- Language indicator for single file -->
+            <!-- Language picker for single file (only shown if the question supports more than one) -->
+            <div v-else-if="availableLanguages.length > 1" style="display:flex;align-items:center;gap:10px;">
+              <span class="text-subtitle-2" style="font-weight:600;">Language:</span>
+              <v-select
+                :model-value="language"
+                @update:model-value="switchLanguage"
+                :items="availableLanguages.map(l => ({ title: l === 'python' ? 'Python' : 'C++', value: l }))"
+                density="compact"
+                variant="outlined"
+                hide-details
+                style="max-width:160px;"
+              >
+                <template v-slot:selection="{ item }">
+                  <v-icon size="small" class="mr-2">{{ item.value === 'python' ? 'mdi-language-python' : 'mdi-language-cpp' }}</v-icon>
+                  <span>{{ item.title }}</span>
+                </template>
+              </v-select>
+            </div>
+
+            <!-- Fixed language indicator when the question only supports one -->
             <div v-else style="display:flex;align-items:center;gap:10px;">
               <v-icon class="mr-2">{{ language === 'python' ? 'mdi-language-python' : 'mdi-language-cpp' }}</v-icon>
               <span class="text-subtitle-2" style="font-weight:600;">Language: {{ language === 'python' ? 'Python' : 'C++' }}</span>
@@ -289,6 +308,9 @@ export default {
       files: [], // Array of {filename, code, editable}
       currentFileIndex: 0,
       language: "cpp", // overwritten once the question loads and reports its real language
+      availableLanguages: [], // which languages THIS question supports; >1 shows a picker
+      starterByLanguage: {}, // per-language starter code from the question, keyed by language
+      codeByLanguage: {}, // in-memory per-language work-in-progress, so switching languages doesn't lose it
       starterCpp: `#include <iostream>
 using namespace std;
 
@@ -432,6 +454,9 @@ if __name__ == "__main__":
       this.runOutput = "";
       this.userMessage = "";
       this.language = "cpp"; // placeholder until fetchProgrammingData reports the real one
+      this.availableLanguages = [];
+      this.starterByLanguage = {};
+      this.codeByLanguage = {};
     },
     startTimers() {
       clearInterval(this.timerInterval);
@@ -458,6 +483,17 @@ if __name__ == "__main__":
     },
     switchFile(newIndex) {
       this.currentFileIndex = newIndex;
+    },
+    switchLanguage(newLanguage) {
+      if (newLanguage === this.language) return;
+      // Stash whatever's in the editor now so coming back to this language later
+      // restores it, instead of overwriting it with the starter code again.
+      this.codeByLanguage[this.language] = this.code;
+      this.language = newLanguage;
+      this.code = this.codeByLanguage[newLanguage]
+        ?? this.starterByLanguage[newLanguage]
+        ?? (newLanguage === 'python' ? this.starterPython : this.starterCpp);
+      this.runOutput = "";
     },
  
     fetchQuestion() {
@@ -499,9 +535,17 @@ if __name__ == "__main__":
               // Single file mode -- language comes from the question itself
               this.isMultiFile = false;
               this.language = (questionData.language || 'cpp').toLowerCase();
-              const starter = this.language === 'python' ? this.starterPython : this.starterCpp;
+              this.availableLanguages = (questionData.languages && questionData.languages.length > 0)
+                ? questionData.languages
+                : [this.language];
+              this.starterByLanguage = questionData.starter_code_by_language || {};
+
+              const fallbackStarter = this.language === 'python' ? this.starterPython : this.starterCpp;
+              const starter = this.starterByLanguage[this.language] || fallbackStarter;
               const saved = res.data.code;
               this.code = saved && saved.trim().length > 0 ? saved : starter;
+              // Seed the in-memory buffer so switching away and back doesn't lose this.
+              this.codeByLanguage[this.language] = this.code;
             }
             
             const durationMinutes = res.data.timer_duration || 30;

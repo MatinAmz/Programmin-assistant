@@ -1816,42 +1816,52 @@ def programming_question_api(page_num):
             })
         
         else:
-            # Single file mode (C++ only)
+            # Single file mode
+            question_language = question.get('language', 'cpp')
+            available_languages = question.get('languages') or [question_language]
+            starter_by_language = question.get('starter_code_by_language') or {}
+
             code = None
             autosaved = mongo.db.code_autosaves.find_one(
                 {'user_id': current_user_id, 'question_id': question_id},
                 sort=[('saved_at', -1)]
             )
-            
+
+            # Whatever language the student was last working in (if any) is what
+            # reopens -- not just the question's nominal default.
+            active_language = question_language
             if autosaved and (autosaved.get('code') or '').strip():
                 code = autosaved['code']
+                active_language = autosaved.get('language') or active_language
             else:
                 submitted = mongo.db.submissions.find_one(
                     {'user_id': current_user_id, 'question_id': question_id}
                 )
                 if submitted and (submitted.get('code') or '').strip():
                     code = submitted['code']
+                    active_language = submitted.get('language') or active_language
                 else:
-                    code = question.get('starter_code', '') or ''
-            
+                    code = starter_by_language.get(active_language) or question.get('starter_code', '') or ''
+
             if isinstance(code, str) and "\\n" in code and "\n" not in code:
                 code = code.replace("\\n", "\n").replace("\\t", "\t")
-            
+
             timer_duration = 30
-            
-            question_language = question.get('language', 'cpp')
+
             return jsonify({
                 'status': 'success',
                 'question': {
                     'question_id': question.get('question_id'),
                     'question_text': question.get('question_text'),
                     'starter_code': question.get('starter_code', ''),
-                    'language': question_language
+                    'starter_code_by_language': starter_by_language,
+                    'language': active_language,
+                    'languages': available_languages
                 },
                 'code': code,
                 'page_num': page_num,
                 'timer_duration': timer_duration,
-                'language': question_language
+                'language': active_language
             })
             
     except Exception as e:
@@ -1944,6 +1954,11 @@ def programming_run_api(page_num):
         if not code.strip():
             return jsonify({'status': 'error', 'message': 'Code is required'}), 400
 
+        question = mongo.db.programmingQuestions.find_one({'question_id': f'programming_q{page_num}'})
+        allowed_languages = (question.get('languages') if question else None) or [question.get('language', 'cpp') if question else 'cpp']
+        if language not in allowed_languages:
+            return jsonify({'status': 'error', 'message': f'This question only supports: {", ".join(allowed_languages)}'}), 400
+
         if language == 'python':
             resp = run_python_once(code, input_data=input_data)
         elif language == 'cpp':
@@ -2022,11 +2037,15 @@ def programming_submit_api(page_num):
     else:
         # Single file submission
         code = data.get('code')
-        language = (question.get('language') or data.get('language') or 'cpp').lower()
+        language = (data.get('language') or question.get('language') or 'cpp').lower()
 
         if not code:
             return jsonify({'status': 'error', 'message': 'No code provided'}), 400
-        
+
+        allowed_languages = question.get('languages') or [question.get('language', 'cpp')]
+        if language not in allowed_languages:
+            return jsonify({'status': 'error', 'message': f'This question only supports: {", ".join(allowed_languages)}'}), 400
+
         test_cases = question.get('test_cases', [])
         test_results = run_code_with_test_cases_multi(language, code, test_cases)
         

@@ -1,7 +1,7 @@
 <template>
   <v-main class="editor-background" style="display:flex;flex-direction:column;height:100vh;overflow:hidden;">
     <v-app-bar app color="white" elevation="2" class="px-4" style="align-items:center;">
-      <h1 class="text-h5 font-weight-bold" style="color:#1b263b;">Programming Assignment</h1>
+      <h1 class="text-h5 font-weight-bold app-bar-title" style="color:#1b263b;">Programming Assignment</h1>
  
       <!-- Timer alert inside app bar -->
       <v-spacer />
@@ -28,14 +28,14 @@
     </v-app-bar>
  
     <!-- Main Content -->
-    <div style="flex:1;display:flex;overflow:hidden;padding:16px;gap:16px;">
+    <div class="main-content-row">
       <!-- Error Alert -->
       <v-alert v-if="errorMessage" type="error" dismissible class="error-alert" @input="errorMessage = ''">
         {{ errorMessage }}
       </v-alert>
  
       <!-- Code Editor (Left Panel) -->
-      <div style="flex:1;display:flex;flex-direction:column;min-width:0;">
+      <div class="editor-panel">
         <v-card elevation="3" class="rounded-card" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
           
           <!-- Question Section - SCROLLABLE -->
@@ -155,7 +155,7 @@
       </div>
  
       <!-- AI Assistant Chat (Right Panel) -->
-      <div style="width:520px;display:flex;flex-direction:column;min-width:0;">
+      <div class="chat-panel">
         <v-card elevation="3" class="rounded-card" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
           <!-- Chat Header -->
           <div class="chat-header">
@@ -830,6 +830,63 @@ if __name__ == "__main__":
 <style scoped>
 .editor-background {
   background-color: #f5f7fa;
+}
+
+/* ========== MAIN LAYOUT (editor + AI chat panels) ========== */
+.main-content-row {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  padding: 16px;
+  gap: 16px;
+}
+
+.editor-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.chat-panel {
+  width: 520px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Below this width there isn't room for editor + a 520px chat panel side by
+   side without squeezing the editor unusably narrow -- stack them instead. */
+@media (max-width: 900px) {
+  .main-content-row {
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .editor-panel {
+    flex: 1 1 55vh;
+    min-height: 320px;
+  }
+
+  .chat-panel {
+    width: 100%;
+    flex: 1 1 55vh;
+    min-height: 320px;
+  }
+}
+
+@media (max-width: 480px) {
+  .main-content-row {
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .app-bar-title {
+    font-size: 1.1rem !important;
+  }
 }
  
 .rounded-card {

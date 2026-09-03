@@ -120,8 +120,10 @@ initialize_conversations_collection()
 initialize_srl_collections()
 # ========== SRL PROMPT CONSTANTS ==========
 
-SRL_SYSTEM_CORE = """
-You are an SRL (Self-Regulated Learning) coding coach for C++ students.
+def get_srl_system_core(language='cpp'):
+    language_label = 'Python' if language.lower() == 'python' else 'C++'
+    return f"""
+You are an SRL (Self-Regulated Learning) coding coach for {language_label} students.
 Your job is to guide through Planning → Monitoring → Reflection without giving solutions.
 NEVER write solution code for users.
 Keep replies ≤ 200 words unless the user explicitly asks for more.
@@ -243,7 +245,7 @@ If they're completely stuck:
 
 # ========== MAIN PROMPT BUILDER(system message) ==========
 
-def build_natural_srl_prompt(question_text, code, terminal_output, conversation_history, current_step_info):
+def build_natural_srl_prompt(question_text, code, terminal_output, conversation_history, current_step_info, language='cpp'):
     # ------ Lightweight context shaping ------
     def _brief(txt, limit):
         if not txt:
@@ -322,7 +324,7 @@ End with: What did you change, and what happened when you compiled again?
     
     # ------ Compose final system message ------
     return f"""
-{SRL_SYSTEM_CORE}
+{get_srl_system_core(language)}
 
 ═══════════════════════════════════════════════════════════════
 TASK CONTEXT
@@ -925,15 +927,15 @@ def run_code_with_test_cases_multi(language: str, code: str, test_cases: list):
     """Run code with test cases - supports Python and C++"""
     if not test_cases:
         return [{"test_name": "No tests", "status": "error", "error": "No test cases configured"}]
-    
-    if language.lower() != "cpp":
-        return [{"test_name": "Runner", "status": "error", "error": f"Unsupported language: {language}"}]
-    
-    if language.lower() == "python":
+
+    language = language.lower()
+
+    if language == "python":
         return run_code_with_test_cases(code, test_cases)
-    
-    
-    
+
+    if language != "cpp":
+        return [{"test_name": "Runner", "status": "error", "error": f"Unsupported language: {language}"}]
+
     gxx = shutil.which("g++")
     if not gxx:
         return [{"test_name": "Compile", "status": "error", "error": "g++ not found"}]
@@ -1837,17 +1839,19 @@ def programming_question_api(page_num):
             
             timer_duration = 30
             
+            question_language = question.get('language', 'cpp')
             return jsonify({
                 'status': 'success',
                 'question': {
                     'question_id': question.get('question_id'),
                     'question_text': question.get('question_text'),
-                    'starter_code': question.get('starter_code', '')
+                    'starter_code': question.get('starter_code', ''),
+                    'language': question_language
                 },
                 'code': code,
                 'page_num': page_num,
                 'timer_duration': timer_duration,
-                'language': 'cpp'  # Force C++ only
+                'language': question_language
             })
             
     except Exception as e:
@@ -1932,16 +1936,21 @@ def programming_run_api(page_num):
             return jsonify({'status': 'error', 'message': err, 'language': 'cpp'}), 400
     
     else:
-        # Single file execution (C++ only)
+        # Single file execution
         code = data.get('code')
-        language = 'cpp'  # Force C++ only
+        language = (data.get('language') or 'cpp').lower()
         input_data = data.get('input', '')
-        
+
         if not code.strip():
             return jsonify({'status': 'error', 'message': 'Code is required'}), 400
-        
-        resp = run_cpp_once(code, input_data=input_data)
-        
+
+        if language == 'python':
+            resp = run_python_once(code, input_data=input_data)
+        elif language == 'cpp':
+            resp = run_cpp_once(code, input_data=input_data)
+        else:
+            return jsonify({'status': 'error', 'message': f'Unsupported language: {language}'}), 400
+
         if resp["status"] == "ok":
             combined = ((resp.get("stdout") or "") + ("\n" + resp.get("stderr") if resp.get("stderr") else "")).strip()
             
@@ -2011,10 +2020,10 @@ def programming_submit_api(page_num):
         })
     
     else:
-        # Single file submission (C++ only)
+        # Single file submission
         code = data.get('code')
-        language = 'cpp'
-        
+        language = (question.get('language') or data.get('language') or 'cpp').lower()
+
         if not code:
             return jsonify({'status': 'error', 'message': 'No code provided'}), 400
         
@@ -2067,6 +2076,11 @@ def response_contains_code(text):
         return True
     cpp_signals = [r'#include\s*<', r'\bint\s+main\s*\(', r'\bstd::\w+', r'\bcout\s*<<', r'\bcin\s*>>']
     if any(re.search(pat, text) for pat in cpp_signals):
+        return True
+    # "return X" alone is too common in ordinary English ("I'll return to that") to
+    # use as a signal on its own -- these are Python-specific enough not to false-positive.
+    python_signals = [r'\bdef\s+\w+\s*\(.*\)\s*:', r'^\s*import\s+\w+', r'\bprint\s*\(']
+    if any(re.search(pat, text, re.MULTILINE) for pat in python_signals):
         return True
     # A couple of semicolon-terminated lines is a strong code signal; one on its own
     # is too common in ordinary prose to flag alone.
@@ -2139,8 +2153,9 @@ def programming_prompt_api(page_num):
             'step_name': srl_state.get('current_step_name', 'Getting started')
         }
         
+        question_language = (question.get('language', 'cpp') if question else 'cpp')
         system_prompt = build_natural_srl_prompt(
-            question_text, code, terminal_output, history, current_step_info
+            question_text, code, terminal_output, history, current_step_info, language=question_language
         )
         
         messages = [{"role": "system", "content": system_prompt}]

@@ -85,10 +85,10 @@
               </v-chip>
             </div>
  
-            <!-- Language indicator for single file (C++ only) -->
+            <!-- Language indicator for single file -->
             <div v-else style="display:flex;align-items:center;gap:10px;">
-              <v-icon class="mr-2">mdi-language-cpp</v-icon>
-              <span class="text-subtitle-2" style="font-weight:600;">Language: C++</span>
+              <v-icon class="mr-2">{{ language === 'python' ? 'mdi-language-python' : 'mdi-language-cpp' }}</v-icon>
+              <span class="text-subtitle-2" style="font-weight:600;">Language: {{ language === 'python' ? 'Python' : 'C++' }}</span>
             </div>
  
             <!-- Right-aligned submit button -->
@@ -275,7 +275,7 @@
 <script>
 import api from "../axios";
 import { Codemirror } from "vue-codemirror";
-// import { python } from "@codemirror/lang-python"; // ✅ COMMENTED OUT - Python not used
+import { python } from "@codemirror/lang-python";
 import { cpp } from "@codemirror/lang-cpp";
 import { oneDark } from "@codemirror/theme-one-dark";
  
@@ -288,18 +288,23 @@ export default {
       isMultiFile: false,
       files: [], // Array of {filename, code, editable}
       currentFileIndex: 0,
-      language: "cpp", // ✅ ALWAYS C++ only
-      
-      // ✅ REMOVED Python starter code - C++ only
+      language: "cpp", // overwritten once the question loads and reports its real language
       starterCpp: `#include <iostream>
 using namespace std;
- 
+
 int main() {
     cout << "Hello, C++!" << endl;
     return 0;
 }
 `,
-      
+      starterPython: `def main():
+    print("Hello, Python!")
+
+
+if __name__ == "__main__":
+    main()
+`,
+
       questionId: this.$route.params.questionId,
       code: "",
       question: "",
@@ -358,7 +363,7 @@ int main() {
         const file = this.files[this.currentFileIndex];
         return file.editable ? `Write your ${file.filename} code here...` : 'This file is read-only';
       }
-      return 'Write your C++ code here...'; // ✅ C++ specific
+      return this.language === 'python' ? 'Write your Python code here...' : 'Write your C++ code here...';
     },
     isCurrentFileReadonly() {
       if (this.isMultiFile && this.files[this.currentFileIndex]) {
@@ -372,7 +377,9 @@ int main() {
       this.questionId = newVal;
       this.initializePage();
     },
-    // ✅ REMOVED language watcher - C++ only
+    language() {
+      this.updateExtensions();
+    },
     errorMessage(newVal) {
       if (newVal) {
         if (this.errorTimeoutId) clearTimeout(this.errorTimeoutId);
@@ -424,7 +431,7 @@ int main() {
       this.runInput = "";
       this.runOutput = "";
       this.userMessage = "";
-      this.language = "cpp"; // ✅ Always C++
+      this.language = "cpp"; // placeholder until fetchProgrammingData reports the real one
     },
     startTimers() {
       clearInterval(this.timerInterval);
@@ -439,14 +446,14 @@ int main() {
       }, 30000);
     },
     updateExtensions() {
-      // ✅ Always C++ only
-      this.extensions = [cpp(), oneDark];
+      this.extensions = this.language === 'python' ? [python(), oneDark] : [cpp(), oneDark];
     },
     getFileIcon(fileIndex) {
       if (!this.isMultiFile || !this.files[fileIndex]) return 'mdi-file-code';
       const filename = this.files[fileIndex].filename;
       if (filename.endsWith('.h')) return 'mdi-file-code';
       if (filename.endsWith('.cpp')) return 'mdi-language-cpp';
+      if (filename.endsWith('.py')) return 'mdi-language-python';
       return 'mdi-file-code';
     },
     switchFile(newIndex) {
@@ -477,10 +484,11 @@ int main() {
           if (res.data.status === "success") {
             const questionData = res.data.question;
             
-            // Check if multi-file question
+            // Check if multi-file question (multi-file is a C++-only feature here --
+            // header/source splitting doesn't apply to Python questions)
             if (questionData.file_structure && questionData.file_structure.type === 'multi-file') {
               this.isMultiFile = true;
-              this.language = 'cpp'; // ✅ Always C++
+              this.language = 'cpp';
               this.files = questionData.file_structure.files.map(file => ({
                 filename: file.filename,
                 code: file.code || '',
@@ -488,12 +496,12 @@ int main() {
               }));
               this.currentFileIndex = 0;
             } else {
-              // Single file mode
+              // Single file mode -- language comes from the question itself
               this.isMultiFile = false;
+              this.language = (questionData.language || 'cpp').toLowerCase();
+              const starter = this.language === 'python' ? this.starterPython : this.starterCpp;
               const saved = res.data.code;
-              this.code = saved && saved.trim().length > 0
-                ? saved
-                : this.starterCpp; // ✅ Always use C++ starter
+              this.code = saved && saved.trim().length > 0 ? saved : starter;
             }
             
             const durationMinutes = res.data.timer_duration || 30;
@@ -559,7 +567,7 @@ int main() {
         
         api.post(
           `/programming/${this.questionId}/autosave`,
-          { code: this.code, language: 'cpp' }, // ✅ Always C++
+          { code: this.code, language: this.language },
           { headers: { Authorization: `Bearer ${token}` } }
         ).catch((err) => {
           console.error("Autosave error:", err);
@@ -574,7 +582,7 @@ int main() {
  
       const payload = this.isMultiFile
         ? { files: this.files, input: this.runInput }
-        : { code: this.code, language: 'cpp', input: this.runInput }; // ✅ Always C++
+        : { code: this.code, language: this.language, input: this.runInput };
  
       api.post(
         `/programming/${this.questionId}/run`,
@@ -609,7 +617,7 @@ int main() {
  
       const payload = this.isMultiFile
         ? { files: this.files }
-        : { code: this.code, language: 'cpp' }; // ✅ Always C++
+        : { code: this.code, language: this.language };
  
       try {
         const response = await api.post(
